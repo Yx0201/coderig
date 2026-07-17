@@ -1,0 +1,17 @@
+{
+  "name": "coderig",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.7.0",
+    "cli-spinners": "^3.4.0",
+    "picocolors": "^1.1.1"
+  }
+}
