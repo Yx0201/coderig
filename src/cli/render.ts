@@ -23,9 +23,7 @@ export function renderLoading() {
       timer = setInterval(() => {
         frameIndex = (frameIndex + 1) % cliSpinners.dots.frames.length;
         process.stdout.write("\r" + " ".repeat(50) + "\r");
-        process.stdout.write(
-          `\r${pc.cyan(cliSpinners.dots.frames[frameIndex])}`,
-        );
+        process.stdout.write(pc.cyan(cliSpinners.dots.frames[frameIndex]));
       }, cliSpinners.dots.interval);
     },
     stop: () => {

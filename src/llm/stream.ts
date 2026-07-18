@@ -21,7 +21,7 @@ export async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
         try {
           const parsed = JSON.parse(data);
           yield parsed;
-        } catch (error) {
+        } catch {
           continue;
         }
       }

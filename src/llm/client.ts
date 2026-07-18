@@ -1,4 +1,4 @@
-import type { ChatMessage,StreamEvent } from "./types.ts";
+import type { ChatMessage, StreamEvent, ToolDef,ToolCall } from "./types.ts";
 import { parseSSE } from "./stream.ts";
 
 const url = process.env.BASE_URL || "";
@@ -8,6 +8,7 @@ const model = process.env.MODEL || "";
 
 export async function* sendMessages(
   messages: ChatMessage[],
+  tools?: ToolDef[],
 ): AsyncGenerator<StreamEvent> {
   const response = await fetch(`${url}${endpoint}`, {
     method: "POST",
@@ -18,6 +19,7 @@ export async function* sendMessages(
     body: JSON.stringify({
       model,
       messages,
+      tools,
       stream: true,
     }),
   });
@@ -27,12 +29,39 @@ export async function* sendMessages(
       `Request failed with status ${response.status} ${response.statusText}`,
     );
 
-  //   yield* parseSSE(response);
+  const acc = new Map<
+    number,
+    {
+      id?: string;
+      name?: string;
+      arguments: string;
+    }
+  >();
 
   for await (const chunk of parseSSE(response)) {
     const delta = chunk.choices?.[0]?.delta;
-    if(delta?.content) yield { type: "content", text: delta.content };
-    if(delta?.reasoning) yield { type: "reasoning", text: delta.reasoning };
-   
+    if (delta?.content) yield { type: "content", text: delta.content };
+    if (delta?.reasoning) yield { type: "reasoning", text: delta.reasoning };
+    if (delta?.tool_calls) {
+      for (const tc of delta.tool_calls) {
+        // 取出该 index 的槽，没有就建一个空槽
+        const slot = acc.get(tc.index) ?? { arguments: "" };
+        if (tc.id) slot.id = tc.id; // 首个chunk才有id，有就覆盖没就保留
+        if (tc.function?.name) slot.name = tc.function.name; // 同上
+        if (tc.function?.arguments) slot.arguments += tc.function.arguments; // arguments累加
+        acc.set(tc.index, slot);
+      }
+    }
+  }
+
+  if (acc.size > 0) {
+    const tool_calls: ToolCall[] = [...acc.entries()]
+      .sort(([a], [b]) => a - b) // 按 index 排序
+      .map(([, slot]) => ({
+        id: slot.id ?? "", // 完整态要求 id 非空
+        type: "function" as const,
+        function: { name: slot.name ?? "", arguments: slot.arguments },
+      }));
+    yield { type: "tool_calls", tool_calls };
   }
 }
