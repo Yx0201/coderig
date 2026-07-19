@@ -1,3 +1,5 @@
+import { readFile, access } from "node:fs/promises";
+import { constants } from "node:fs";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
 export const readFileDef: ToolDef = {
@@ -24,10 +26,13 @@ export const readFileHandler: ToolHandler = async (args) => {
   if (!path) return "错误：缺少 path 参数";
   // 守卫2：读文件，失败返回错误字符串而非 throw
   try {
-    const file = Bun.file(path);
-    const exists = await file.exists();
-    if (!exists) return `错误：文件不存在 ${path}`;
-    return await file.text();
+    // 先判断存在性，给出明确的"文件不存在"提示
+    try {
+      await access(path, constants.R_OK);
+    } catch {
+      return `错误：文件不存在 ${path}`;
+    }
+    return await readFile(path, "utf8");
   } catch (e) {
     return `错误：读取文件失败 ${e instanceof Error ? e.message : String(e)}`;
   }
