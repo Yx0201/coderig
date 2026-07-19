@@ -88,9 +88,9 @@ export const grepHandler: ToolHandler = async (args) => {
         const lines = content.split("\n");
         const matched: { n: number; line: string }[] = [];
         for (let i = 0; i < lines.length; i++) {
-          re.lastIndex = 0;
-          if (re.test(lines[i])) {
-            matched.push({ n: i + 1, line: lines[i].trim().slice(0, 100) });
+          const line = lines[i]; // noUncheckedIndexedAccess: 下标访问返回 string | undefined
+          if (line !== undefined && re.test(line)) {
+            matched.push({ n: i + 1, line: line.trim().slice(0, 100) });
             if (matched.length >= MAX_LINES_PER_FILE) break;
           }
         }

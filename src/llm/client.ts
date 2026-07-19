@@ -21,6 +21,7 @@ export async function* sendMessages(
       messages,
       tools,
       stream: true,
+      stream_options: { include_usage: true }, // 让流式最后一个 chunk 携带 token 用量
     }),
   });
 
@@ -52,6 +53,8 @@ export async function* sendMessages(
         acc.set(tc.index, slot);
       }
     }
+    // 带 include_usage 的最后一个 chunk：choices 为空、只带 usage
+    if (chunk.usage) yield { type: "usage", usage: chunk.usage };
   }
 
   if (acc.size > 0) {

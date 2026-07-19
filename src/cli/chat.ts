@@ -4,11 +4,12 @@ import type { ChatMessage, ToolCall } from "../llm/types.ts";
 import { sendMessages } from "../llm/client.ts";
 import pc from "picocolors";
 import { get, listDefs } from "../tools/registry.ts";
+import { Tracer } from "../observability/tracer.ts";
 
-// 按码点截断，避免从多字节字符(emoji)中间切断导致乱码
-const preview = (s: string, n = 200) => Array.from(s).slice(0, n).join("");
+const tracer = new Tracer();
 
 export async function startChat() {
+  tracer.startSession();
   process.stdout.write("welcome to the chat!\n");
 
   const loading = renderLoading();
@@ -20,6 +21,7 @@ export async function startChat() {
     });
 
     if (p.isCancel(input)) {
+      tracer.endSession();
       console.log("Bey~");
       break;
     }
@@ -34,10 +36,15 @@ export async function startChat() {
         renderError("达到最大轮数，停止");
         break;
       }
+      tracer.nextRound();
+      tracer.llmStart();
       let answer = "";
       loading.start();
       let started = false;
       let toolCallsToRun: ToolCall[] | null = null;
+      let contentLen = 0;
+      let reasoningLen = 0;
+      let currentUsage: any;
       let lastType: "reasoning" | "content" | "tool_calls" | null = null;
       try {
         for await (const event of sendMessages(history, listDefs())) {
@@ -52,25 +59,37 @@ export async function startChat() {
           if (event.type === "content" && lastType === "reasoning") {
             process.stdout.write("\n"); // 思考→回答 切换，换行分隔
           }
-          lastType = event.type;
+          if (event.type !== "usage") lastType = event.type;
           switch (event.type) {
             case "content":
               process.stdout.write(event.text);
               answer += event.text;
+              contentLen += event.text.length;
               break;
             case "reasoning":
               process.stdout.write(pc.dim(event.text));
+              reasoningLen += event.text.length;
               break;
             case "tool_calls":
               toolCallsToRun = event.tool_calls;
               break;
+            case "usage":
+              currentUsage = event.usage; // usage 来自最后一个特殊 chunk,本轮结束才有
+              break;
           }
         }
+        // 一轮流完,记一次 llm_end(本轮元信息 + usage),在循环外只调一次
+        tracer.llmEnd({
+          contentLen,
+          reasoningLen,
+          toolCallsCount: toolCallsToRun?.length ?? 0,
+          usage: currentUsage,
+        });
       } catch (err) {
+        const msg = `请求失败: ${err instanceof Error ? err.message : String(err)}`;
         if (!started) loading.stop();
-        renderError(
-          `请求失败: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        tracer.error(msg); // 记错误事件
+        renderError(msg);
         break; // 请求失败：跳出 agent loop，不执行工具、不保存半截回答
       } finally {
         if (!started) loading.stop();
@@ -97,18 +116,19 @@ export async function startChat() {
           args = JSON.parse(tc.function.arguments);
         } catch {}
 
+        tracer.toolCall(tc.function.name, args); // 记工具调用开始(点事件)
+
         const entry = get(tc.function.name);
         let result: string;
+        let ok = true;
         if (!entry) {
           result = `错误：未知工具 ${tc.function.name}`;
+          ok = false;
         } else {
           result = await entry.handler(args);
         }
 
-        // 渲染（先简单）
-        process.stdout.write(
-          `\n🔧 ${tc.function.name}(${tc.function.arguments}) → ${preview(result)}\n`,
-        );
+        tracer.toolResult(tc.function.name, result, ok); // 记工具返回(段事件,带 duration,实时打 🔧 行)
 
         history = [
           ...history,

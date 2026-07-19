@@ -35,13 +35,23 @@ export interface SSEChunk {
       }[];
     };
   }[];
+  // 带 stream_options.include_usage 时，最后一个 chunk 的 choices 为空数组、
+  // 只携带 usage 字段（其余字段仍存在）
+  usage?: TokenUsage;
   [k: string]: any; // 允许其它字段
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 export type StreamEvent =
   | { type: "reasoning"; text: string }
   | { type: "content"; text: string }
-  | { type: "tool_calls"; tool_calls: ToolCall[] };
+  | { type: "tool_calls"; tool_calls: ToolCall[] }
+  | { type: "usage"; usage: TokenUsage };
 
 export interface ToolDef {
   type: "function";
