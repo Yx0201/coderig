@@ -51,7 +51,8 @@ export type StreamEvent =
   | { type: "reasoning"; text: string }
   | { type: "content"; text: string }
   | { type: "tool_calls"; tool_calls: ToolCall[] }
-  | { type: "usage"; usage: TokenUsage };
+  | { type: "usage"; usage: TokenUsage }
+  | { type: "raw"; data: string }; // 本轮所有 SSE 的原始 data(JSON.parse 前),诊断 LLM 实际输出用
 
 export interface ToolDef {
   type: "function";

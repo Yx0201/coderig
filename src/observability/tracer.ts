@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 
 // 一条 trace 事件的结构。所有方法最终都产出一个 TraceEvent 落盘。
 export interface TraceEvent {
+  sid: string; // 会话 id。所有会话追加进同一个 jsonl,靠它切出单次会话做前后对比
   seq: number; // 全局递增序号，看流程顺序用
   round: number; // 第几轮 agent loop；session 级事件用 0
   type:
@@ -12,6 +13,8 @@ export interface TraceEvent {
     | "llm_end" // 一次 sendMessages 结束(段事件,带 duration)
     | "tool_call" // 工具调用开始(点事件)
     | "tool_result" // 工具返回(段事件,带 duration)
+    | "user_message" // 用户在本会话中发送的一条消息
+    | "llm_raw" // 某轮 LLM 返回的原始 SSE data(JSON.parse 前),诊断 think/content 用
     | "error"; // 错误
   ts: number; // 相对 session 开始的毫秒
   duration?: number; // 仅段事件有:本段耗时(ms)
@@ -31,15 +34,29 @@ export interface LlmEndMeta {
   };
 }
 
+// 会话开始时记录的实验元数据:提示词 A/B 对比全靠 session_start 里的这几个字段
+export interface SessionMeta {
+  promptVersion: string; // "none" = 无系统提示词基线;"v1"/"v2" = 实验组
+  systemPromptChars: number; // 系统提示词字符数(none 时为 0)
+  model: string; // 用的哪个模型,不同模型的 trace 不可比
+}
+
 // 会话结束时的汇总
 export interface SessionSummary {
+  promptVersion: string; // 冗余一份,单看 session_end 也知道是哪组实验
   totalRounds: number; // 总轮数
   totalDuration: number; // 总耗时(ms)
   totalTokens: number; // 累计 completion tokens
+  totalPromptTokens: number; // 累计 prompt tokens(每轮重发全量上下文,这是真实成本口径)
+  toolCalls: number; // 工具调用总次数
+  toolFailures: number; // 工具失败次数(ok:false),提示词是否改善工具纪律看这个
 }
 
 // 工具结果/参数预览的最大长度,防止 13k 的 html content 撑爆 trace 文件
 const PREVIEW_LEN = 200;
+// 单条 SSE 原始报文的截断长度:逐 chunk 截断而非整体截断,
+// 保证每个 chunk 的字段结构(reasoning vs content)都完整可见——这正是诊断 think/content 需要的
+const RAW_CHUNK_LEN = 1500;
 
 export class Tracer {
   // 已推入的事件(内存里留一份,endSession 时其实已流式落盘,这里也留作汇总用)
@@ -56,28 +73,44 @@ export class Tracer {
   private toolStartTs = 0;
   // 累计的 completion tokens,endSession 汇总用
   private totalCompletionTokens = 0;
+  // 累计的 prompt tokens(每轮都重发全量上下文,累加才是真实成本)
+  private totalPromptTokens = 0;
+  // 工具调用/失败计数,endSession 汇总用
+  private toolCallCount = 0;
+  private toolFailureCount = 0;
+  // 会话 id + 实验元数据,startSession 时锚定
+  private sessionId = "";
+  private meta: SessionMeta = { promptVersion: "?", systemPromptChars: 0, model: "?" };
   // 落盘路径
   private logPath = "logs/trace.jsonl";
 
-  // 会话开始:记一条 session_start,并把 sessionStart 锚定(后续 ts 都相对它)
-  startSession() {
+  // 会话开始:记一条 session_start(带实验元数据),生成 sessionId 并锚定 sessionStart
+  startSession(meta?: SessionMeta) {
     this.sessionStart = Date.now();
-    this.push("session_start", { ts_note: "会话开始" });
+    this.sessionId = new Date().toISOString().replace(/[:.]/g, "-");
+    if (meta) this.meta = meta;
+    this.push("session_start", { ...this.meta });
   }
 
-  // 会话结束:Tracer 内部已有全部汇总所需数据(round/sessionStart/totalCompletionTokens),
+  // 会话结束:Tracer 内部已有全部汇总所需数据(round/sessionStart/各计数器),
   // 自行计算并落 session_end + 打终端总结——调用方无需传任何参数
   endSession() {
     const summary: SessionSummary = {
+      promptVersion: this.meta.promptVersion,
       totalRounds: this.round,
       totalDuration: Date.now() - this.sessionStart,
       totalTokens: this.totalCompletionTokens,
+      totalPromptTokens: this.totalPromptTokens,
+      toolCalls: this.toolCallCount,
+      toolFailures: this.toolFailureCount,
     };
     this.push("session_end", summary);
-    // 终端打一行汇总:轮数 / 总耗时 / 总 token
+    // 终端打一行汇总:实验组 / 轮数 / 总耗时 / 双向 token / 工具成败
     const sec = (summary.totalDuration / 1000).toFixed(1);
     process.stdout.write(
-      `\n✓ 完成 · ${summary.totalRounds} 轮 · ${sec}s · ${summary.totalTokens} tokens\n`,
+      `\n✓ 完成 [${summary.promptVersion}] · ${summary.totalRounds} 轮 · ${sec}s` +
+        ` · ↑${summary.totalPromptTokens} ↓${summary.totalTokens} tokens` +
+        ` · 工具 ${summary.toolCalls} 次(失败 ${summary.toolFailures})\n`,
     );
   }
 
@@ -95,7 +128,10 @@ export class Tracer {
   // LLM 调用结束:记 llm_end(段事件),duration = 现在 - 本轮开始
   // meta 里的 usage 若存在,累计 completion tokens 供会话汇总
   llmEnd(meta: LlmEndMeta) {
-    if (meta.usage) this.totalCompletionTokens += meta.usage.completion_tokens;
+    if (meta.usage) {
+      this.totalCompletionTokens += meta.usage.completion_tokens;
+      this.totalPromptTokens += meta.usage.prompt_tokens;
+    }
     this.push("llm_end", {
       ...meta, // contentLen/reasoningLen/toolCallsCount/usage
       duration: Date.now() - this.roundStartTs,
@@ -109,6 +145,7 @@ export class Tracer {
 
   toolCall(name: string, args: unknown) {
     this.toolStartTs = Date.now();
+    this.toolCallCount++;
     this.lastToolName = name;
     this.lastToolArgsPreview = this.truncate(args);
     this.push("tool_call", { name, args: this.lastToolArgsPreview });
@@ -117,6 +154,7 @@ export class Tracer {
   // 工具返回:记 tool_result(段事件),duration = 现在 - 该工具调用开始,result 截断
   // 实时展示:name(args预览) → result预览 · 耗时,让用户既看到传了啥参数、又看到返回啥
   toolResult(name: string, result: string, ok: boolean) {
+    if (!ok) this.toolFailureCount++;
     const resultPreview = this.truncate(result);
     const event = this.push("tool_result", {
       name,
@@ -130,6 +168,20 @@ export class Tracer {
     );
   }
 
+  // 用户消息:记一条 user_message(点事件),text 截断后存。用于回放"用户每轮问了啥"
+  userMessage(text: string) {
+    this.push("user_message", { text: this.truncate(text) });
+  }
+
+  // 某轮 LLM 的原始 SSE 报文:逐 chunk 截断后整体存,每行 = 一条原始 data
+  llmRaw(raw: string) {
+    const capped = raw
+      .split("\n")
+      .map((line) => this.truncate(line, RAW_CHUNK_LEN))
+      .join("\n");
+    this.push("llm_raw", { raw: capped });
+  }
+
   // 错误:记 error 事件
   error(message: string) {
     this.push("error", { message });
@@ -141,6 +193,7 @@ export class Tracer {
     // 算 duration:仅段事件(llm_end/tool_result)在 data 里带了 duration,这里取出挂到事件顶层
     const duration = typeof data?.duration === "number" ? data.duration : undefined;
     const event: TraceEvent = {
+      sid: this.sessionId,
       seq: ++this.seq,
       round: type === "session_start" || type === "session_end" ? 0 : this.round,
       type,
@@ -154,14 +207,20 @@ export class Tracer {
     return event;
   }
 
+  // 写盘队列:appendFile 是异步的,事件密集时并发写会乱序(seq 1,4,6,2…),
+  // 用 promise 链把每次写串在上一次后面,保证文件里的行序 = 事件序
+  private writeQueue: Promise<void> = Promise.resolve();
+
   // 把单条事件追加写入 jsonl 文件(每行一个 JSON,流式友好、可 tail -f / jq)
-  private async persist(event: TraceEvent) {
-    try {
-      await mkdir(dirname(this.logPath), { recursive: true });
-      await appendFile(this.logPath, JSON.stringify(event) + "\n", "utf8");
-    } catch {
-      // 落盘失败不能影响主流程(观测层不能把 agent 搞崩),静默吞掉
-    }
+  private persist(event: TraceEvent) {
+    this.writeQueue = this.writeQueue.then(async () => {
+      try {
+        await mkdir(dirname(this.logPath), { recursive: true });
+        await appendFile(this.logPath, JSON.stringify(event) + "\n", "utf8");
+      } catch {
+        // 落盘失败不能影响主流程(观测层不能把 agent 搞崩),静默吞掉
+      }
+    });
   }
 
   // 实时终端展示:从事件派生简短输出,让用户跑的过程中有感知
@@ -182,7 +241,7 @@ export class Tracer {
   }
 
   // 截断大字符串/对象为预览长度,避免 13k 的 html content 撑爆 trace 文件
-  private truncate(value: unknown): string {
+  private truncate(value: unknown, max = PREVIEW_LEN): string {
     let s: string;
     if (typeof value === "string") {
       s = value;
@@ -193,6 +252,6 @@ export class Tracer {
         s = String(value);
       }
     }
-    return s.length > PREVIEW_LEN ? s.slice(0, PREVIEW_LEN) + "…" : s;
+    return s.length > max ? s.slice(0, max) + "…" : s;
   }
 }

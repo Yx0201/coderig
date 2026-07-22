@@ -5,11 +5,18 @@ import { sendMessages } from "../llm/client.ts";
 import pc from "picocolors";
 import { get, listDefs } from "../tools/registry.ts";
 import { Tracer } from "../observability/tracer.ts";
+import { resolveSystemPrompt } from "../prompts/system.ts";
 
 const tracer = new Tracer();
 
 export async function startChat() {
-  tracer.startSession();
+  // 把本次会话的实验元数据(提示词版本/长度/模型)写进 session_start,前后对比全靠它
+  const sys = resolveSystemPrompt();
+  tracer.startSession({
+    promptVersion: sys.version,
+    systemPromptChars: sys.content?.length ?? 0,
+    model: process.env.MODEL || "?",
+  });
   process.stdout.write("welcome to the chat!\n");
 
   const loading = renderLoading();
@@ -28,6 +35,7 @@ export async function startChat() {
 
     if (!input.trim()) continue;
     history = [...history, { role: "user", content: input }];
+    tracer.userMessage(input); // 记录用户本轮的输入(点事件)
 
     let rounds = 0;
     while (true) {
@@ -59,7 +67,8 @@ export async function startChat() {
           if (event.type === "content" && lastType === "reasoning") {
             process.stdout.write("\n"); // 思考→回答 切换，换行分隔
           }
-          if (event.type !== "usage") lastType = event.type;
+          // raw 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
+          if (event.type !== "usage" && event.type !== "raw") lastType = event.type;
           switch (event.type) {
             case "content":
               process.stdout.write(event.text);
@@ -75,6 +84,9 @@ export async function startChat() {
               break;
             case "usage":
               currentUsage = event.usage; // usage 来自最后一个特殊 chunk,本轮结束才有
+              break;
+            case "raw":
+              tracer.llmRaw(event.data); // 本轮原始 SSE 报文落盘,诊断 think/content 用
               break;
           }
         }
@@ -114,7 +126,13 @@ export async function startChat() {
         let args: any = {};
         try {
           args = JSON.parse(tc.function.arguments);
-        } catch {}
+        } catch {
+          // 参数解析失败是"模型没产出规范 JSON"的信号,必须记下来——
+          // 这是观察提示词是否改善工具纪律的重要指标,不能静默吞掉
+          tracer.error(
+            `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
+          );
+        }
 
         tracer.toolCall(tc.function.name, args); // 记工具调用开始(点事件)
 
@@ -126,6 +144,8 @@ export async function startChat() {
           ok = false;
         } else {
           result = await entry.handler(args);
+          // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
+          if (result.startsWith("错误")) ok = false;
         }
 
         tracer.toolResult(tc.function.name, result, ok); // 记工具返回(段事件,带 duration,实时打 🔧 行)

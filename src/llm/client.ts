@@ -1,5 +1,6 @@
 import type { ChatMessage, StreamEvent, ToolDef,ToolCall } from "./types.ts";
 import { parseSSE } from "./stream.ts";
+import { resolveSystemPrompt } from "../prompts/system.ts";
 
 const url = process.env.BASE_URL || "";
 const endpoint = process.env.ENDPOINT || "";
@@ -10,6 +11,8 @@ export async function* sendMessages(
   messages: ChatMessage[],
   tools?: ToolDef[],
 ): AsyncGenerator<StreamEvent> {
+  // PROMPT_VERSION=none 时 content 为 null → 不注入,跑无系统提示词的基线
+  const sys = resolveSystemPrompt();
   const response = await fetch(`${url}${endpoint}`, {
     method: "POST",
     headers: {
@@ -18,7 +21,9 @@ export async function* sendMessages(
     },
     body: JSON.stringify({
       model,
-      messages,
+      messages: sys.content
+        ? [{ role: "system", content: sys.content }, ...messages]
+        : messages,
       tools,
       stream: true,
       stream_options: { include_usage: true }, // 让流式最后一个 chunk 携带 token 用量
@@ -39,7 +44,10 @@ export async function* sendMessages(
     }
   >();
 
-  for await (const chunk of parseSSE(response)) {
+  // 收集本轮所有 SSE 的原始 data(JSON.parse 前),流末一次性 yield 给 tracer 落盘
+  const raws: string[] = [];
+
+  for await (const chunk of parseSSE(response, (r) => raws.push(r))) {
     const delta = chunk.choices?.[0]?.delta;
     if (delta?.content) yield { type: "content", text: delta.content };
     if (delta?.reasoning) yield { type: "reasoning", text: delta.reasoning };
@@ -56,6 +64,9 @@ export async function* sendMessages(
     // 带 include_usage 的最后一个 chunk：choices 为空、只带 usage
     if (chunk.usage) yield { type: "usage", usage: chunk.usage };
   }
+
+  // 本轮原始报文:yield 一次供 tracer 落 llm_raw 事件(诊断 think/content 用)
+  if (raws.length) yield { type: "raw", data: raws.join("\n") };
 
   if (acc.size > 0) {
     const tool_calls: ToolCall[] = [...acc.entries()]
