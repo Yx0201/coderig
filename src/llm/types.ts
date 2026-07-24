@@ -52,6 +52,7 @@ export type StreamEvent =
   | { type: "content"; text: string }
   | { type: "tool_calls"; tool_calls: ToolCall[] }
   | { type: "usage"; usage: TokenUsage }
+  | { type: "finish"; finish_reason: string | null } // 本轮 finish_reason(stop/tool_calls/length/null),判停兜底用
   | { type: "raw"; data: string }; // 本轮所有 SSE 的原始 data(JSON.parse 前),诊断 LLM 实际输出用
 
 export interface ToolDef {

@@ -8,7 +8,7 @@ const ak = process.env.API_KEY || "";
 const model = process.env.MODEL || "";
 
 export async function* sendMessages(
-  messages: ChatMessage[],
+  messages: readonly ChatMessage[],
   tools?: ToolDef[],
 ): AsyncGenerator<StreamEvent> {
   // PROMPT_VERSION=none 时 content 为 null → 不注入,跑无系统提示词的基线
@@ -46,9 +46,14 @@ export async function* sendMessages(
 
   // 收集本轮所有 SSE 的原始 data(JSON.parse 前),流末一次性 yield 给 tracer 落盘
   const raws: string[] = [];
+  // 捕获本轮 finish_reason(stop/tool_calls/length/null)。它在最后一个 content chunk 上,
+  // 不在 usage chunk 上,所以要在循环里见一个记一个。判停兜底靠它区分"真回答完" vs "空收尾"
+  let finishReason: string | null = null;
 
   for await (const chunk of parseSSE(response, (r) => raws.push(r))) {
-    const delta = chunk.choices?.[0]?.delta;
+    const choice = chunk.choices?.[0];
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    const delta = choice?.delta;
     if (delta?.content) yield { type: "content", text: delta.content };
     if (delta?.reasoning) yield { type: "reasoning", text: delta.reasoning };
     if (delta?.tool_calls) {
@@ -67,6 +72,8 @@ export async function* sendMessages(
 
   // 本轮原始报文:yield 一次供 tracer 落 llm_raw 事件(诊断 think/content 用)
   if (raws.length) yield { type: "raw", data: raws.join("\n") };
+  // 本轮 finish_reason:判停兜底用(stop=真回答完, length=被截断, tool_calls=调工具, null=没拿到)
+  yield { type: "finish", finish_reason: finishReason };
 
   if (acc.size > 0) {
     const tool_calls: ToolCall[] = [...acc.entries()]

@@ -1,5 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
+import { unlinkSync } from "node:fs";
 import { dirname } from "node:path";
+import pc from "picocolors";
 
 // 一条 trace 事件的结构。所有方法最终都产出一个 TraceEvent 落盘。
 export interface TraceEvent {
@@ -15,6 +17,7 @@ export interface TraceEvent {
     | "tool_result" // 工具返回(段事件,带 duration)
     | "user_message" // 用户在本会话中发送的一条消息
     | "llm_raw" // 某轮 LLM 返回的原始 SSE data(JSON.parse 前),诊断 think/content 用
+    | "nudge" // 空回答兜底:模型本轮无 content/tool_calls,harness 注入续轮提示
     | "error"; // 错误
   ts: number; // 相对 session 开始的毫秒
   duration?: number; // 仅段事件有:本段耗时(ms)
@@ -26,6 +29,7 @@ export interface LlmEndMeta {
   contentLen: number; // 本轮 content 总字符数(累计流式片段)
   reasoningLen: number; // 本轮 reasoning 总字符数
   toolCallsCount: number; // 本轮产出几个 tool_call
+  finishReason?: string | null; // 模型本轮的 finish_reason(stop/tool_calls/length/null),判停兜底用
   usage?: {
     // 来自最后一个 usage chunk 的 token 用量,可能拿不到
     prompt_tokens: number;
@@ -39,6 +43,7 @@ export interface SessionMeta {
   promptVersion: string; // "none" = 无系统提示词基线;"v1"/"v2" = 实验组
   systemPromptChars: number; // 系统提示词字符数(none 时为 0)
   model: string; // 用的哪个模型,不同模型的 trace 不可比
+  cid?: string; // 关联的对话 id(见 src/history/store.ts)。续话时新 sid 复用旧 cid,靠它把多次 run 关联到同一段对话
 }
 
 // 会话结束时的汇总
@@ -90,6 +95,16 @@ export class Tracer {
     this.sessionId = new Date().toISOString().replace(/[:.]/g, "-");
     if (meta) this.meta = meta;
     this.push("session_start", { ...this.meta });
+  }
+
+  // 清空旧日志:每次运行开头调一次,保证本次 trace 是干净的。
+  // 用同步 unlink:必须赶在第一条 startSession 的异步 append 之前完成,否则清空和写入会竞争
+  clearLog() {
+    try {
+      unlinkSync(this.logPath);
+    } catch {
+      // 文件不存在(首次运行)或其它原因,忽略——下次 appendFile 会自动重建
+    }
   }
 
   // 会话结束:Tracer 内部已有全部汇总所需数据(round/sessionStart/各计数器),
@@ -182,6 +197,13 @@ export class Tracer {
     this.push("llm_raw", { raw: capped });
   }
 
+  // 空回答兜底:模型本轮无 content 也无 tool_calls,harness 注入 nudge 续轮。
+  // reason 记原因(finish_reason 等),终端打一行灰色提示让用户知道发生了啥(不是静默结束)
+  nudge(reason: string) {
+    this.push("nudge", { reason });
+    process.stdout.write(pc.dim(`\n↻ 续轮提示:模型本轮无回答/无工具调用(${reason}),已注入提示继续\n`));
+  }
+
   // 错误:记 error 事件
   error(message: string) {
     this.push("error", { message });
@@ -224,18 +246,14 @@ export class Tracer {
   }
 
   // 实时终端展示:从事件派生简短输出,让用户跑的过程中有感知
-  // 不是把每条都打(太吵),只打关键节点:llm_start(round 标记)、tool_result(已在 toolResult 打)、session_end(已在 endSession 打)
+  // 注意:不要再打 round 标记——它紧跟 loading.start() 的 spinner,会被一帧覆盖,
+  // 用户只看到一闪而逝的 round 信息。round/usage 等都已在 trace 文件里,终端不重复打。
   private display(event: TraceEvent) {
     switch (event.type) {
-      case "llm_start":
-        // 每轮开头打个 round 标记,让用户知道"这是第几轮、模型又开始想了"
-        process.stdout.write(`\n● round ${event.round} · 思考中…`);
-        break;
-      case "tool_call":
       case "tool_result":
-      case "llm_end":
-      case "error":
-        // tool_result 在 toolResult() 已专门打;llm_end/error 不单独打,避免和流式输出打架
+        // tool_result 在 toolResult() 里已专门打(🔧 name → result · 耗时),这里不重复
+        break;
+      default:
         break;
     }
   }
