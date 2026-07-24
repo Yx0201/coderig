@@ -10,6 +10,7 @@ import { resolveSystemPrompt } from "../prompts/system.ts";
 const tracer = new Tracer();
 
 export async function startChat() {
+  tracer.clearLog(); // 每次运行开头清空旧日志,本次 trace 干净(见 CLAUDE.md 观测约定)
   // 把本次会话的实验元数据(提示词版本/长度/模型)写进 session_start,前后对比全靠它
   const sys = resolveSystemPrompt();
   tracer.startSession({
@@ -38,6 +39,13 @@ export async function startChat() {
     tracer.userMessage(input); // 记录用户本轮的输入(点事件)
 
     let rounds = 0;
+    // 连续空回答计数:模型本轮无 content 也无 tool_calls 时 +1,有产出时归零。
+    // 防止对"只想不答"的模型无限 nudge。超过上限就明确放弃,而不是静默结束
+    let emptyRounds = 0;
+    const MAX_NUDGE = 2; // 最多续轮 2 次,再不答就放弃
+    // nudge 文本:塞回 history 当一条 user 消息,把模型从"只想不说"拉回"给出回答或行动"
+    const NUDGE_TEXT =
+      "你上一轮只输出了思考,没有给出最终回答,也没有调用工具。请直接用正文回答用户,或调用工具继续完成任务。";
     while (true) {
       rounds++;
       if (rounds > 10) {
@@ -53,6 +61,7 @@ export async function startChat() {
       let contentLen = 0;
       let reasoningLen = 0;
       let currentUsage: any;
+      let currentFinishReason: string | null = null; // 本轮 finish_reason,判停兜底用
       let lastType: "reasoning" | "content" | "tool_calls" | null = null;
       try {
         for await (const event of sendMessages(history, listDefs())) {
@@ -67,8 +76,13 @@ export async function startChat() {
           if (event.type === "content" && lastType === "reasoning") {
             process.stdout.write("\n"); // 思考→回答 切换，换行分隔
           }
-          // raw 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
-          if (event.type !== "usage" && event.type !== "raw") lastType = event.type;
+          // raw/finish 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
+          if (
+            event.type !== "usage" &&
+            event.type !== "raw" &&
+            event.type !== "finish"
+          )
+            lastType = event.type;
           switch (event.type) {
             case "content":
               process.stdout.write(event.text);
@@ -85,16 +99,20 @@ export async function startChat() {
             case "usage":
               currentUsage = event.usage; // usage 来自最后一个特殊 chunk,本轮结束才有
               break;
+            case "finish":
+              currentFinishReason = event.finish_reason; // 判停兜底靠它
+              break;
             case "raw":
               tracer.llmRaw(event.data); // 本轮原始 SSE 报文落盘,诊断 think/content 用
               break;
           }
         }
-        // 一轮流完,记一次 llm_end(本轮元信息 + usage),在循环外只调一次
+        // 一轮流完,记一次 llm_end(本轮元信息 + usage + finish_reason),在循环外只调一次
         tracer.llmEnd({
           contentLen,
           reasoningLen,
           toolCallsCount: toolCallsToRun?.length ?? 0,
+          finishReason: currentFinishReason,
           usage: currentUsage,
         });
       } catch (err) {
@@ -109,11 +127,39 @@ export async function startChat() {
 
       // 判停 + 执行 + 回填
       if (!toolCallsToRun || toolCallsToRun.length === 0) {
-        // 没有工具调用 → 最终回答
-        if (answer)
+        // finish_reason=length:被截断,nudge 无益(还会被截),记下并终止
+        if (currentFinishReason === "length") {
+          tracer.error("本轮被截断(finish_reason=length),可能上下文过长");
+          renderError("模型输出被截断,本轮无完整回答");
+          if (answer.trim())
+            history = [...history, { role: "assistant", content: answer }];
+          break;
+        }
+        const hasContent = answer.trim().length > 0;
+        // 有 content → 正常最终回答,收工
+        if (hasContent) {
           history = [...history, { role: "assistant", content: answer }];
-        break; // ← 退出内层 while，回到外层等输入
+          break;
+        }
+        // 无 content 且无 tool_calls → 空收尾(模型可能只吐了 reasoning 就 finish)。
+        // 这正是"harness 兜底"该介入处:不再静默结束,而是 nudge 续轮让模型把话说完/行动完
+        emptyRounds++;
+        if (emptyRounds > MAX_NUDGE) {
+          tracer.error(`连续 ${emptyRounds} 轮无回答,放弃本轮`);
+          renderError("模型多次未给出回答,已停止");
+          break;
+        }
+        // 回填本轮空 assistant(保持轮次交替),再注入 nudge user 消息,继续内层 while
+        history = [...history, { role: "assistant", content: answer }];
+        history = [...history, { role: "user", content: NUDGE_TEXT }];
+        tracer.nudge(
+          `第 ${emptyRounds} 次 · finish_reason=${currentFinishReason ?? "null"} · reasoningLen=${reasoningLen}`,
+        );
+        continue; // 不 break,回到内层 while 顶再问一次模型
       }
+
+      // 走到这里说明有工具调用:模型本轮有产出,空回答计数归零
+      emptyRounds = 0;
 
       // 有工具调用：先回填 assistant（带 tool_calls）
       history = [
