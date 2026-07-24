@@ -6,22 +6,36 @@ import pc from "picocolors";
 import { get, listDefs } from "../tools/registry.ts";
 import { Tracer } from "../observability/tracer.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
+import { History } from "../history/store.ts";
 
 const tracer = new Tracer();
 
-export async function startChat() {
+// 续话:传一个已有 cid,把那段对话的转录灌回内存接着聊;
+// 不传则新开一段对话。两种情况都各自记一份观测(trace 的新 sid),但 cid 跨续话保持不变
+export async function startChat(resumeCid?: string) {
   tracer.clearLog(); // 每次运行开头清空旧日志,本次 trace 干净(见 CLAUDE.md 观测约定)
-  // 把本次会话的实验元数据(提示词版本/长度/模型)写进 session_start,前后对比全靠它
   const sys = resolveSystemPrompt();
+  const model = process.env.MODEL || "?";
+
+  // history 与 trace 分开持久化:cid 标对话,sid 标一次运行。
+  // 续话 = 新 sid(新观测)+ 同一个 cid(同一段对话)。
+  // 把 cid 关联进 session_start,事后看某次实验的 trace 能反查它跑的是哪段对话
+  const history = resumeCid
+    ? await History.load(resumeCid)
+    : History.create({ model, promptVersion: sys.version });
   tracer.startSession({
     promptVersion: sys.version,
     systemPromptChars: sys.content?.length ?? 0,
-    model: process.env.MODEL || "?",
+    model,
+    cid: history.cid,
   });
-  process.stdout.write("welcome to the chat!\n");
+  process.stdout.write(
+    resumeCid
+      ? `welcome back! 续话 ${history.cid} (${history.messages.length} 条历史消息)\n`
+      : `welcome to the chat! 新对话 ${history.cid}\n`,
+  );
 
   const loading = renderLoading();
-  let history: ChatMessage[] = [];
 
   while (true) {
     const input = await p.text({
@@ -35,7 +49,7 @@ export async function startChat() {
     }
 
     if (!input.trim()) continue;
-    history = [...history, { role: "user", content: input }];
+    history.append({ role: "user", content: input });
     tracer.userMessage(input); // 记录用户本轮的输入(点事件)
 
     let rounds = 0;
@@ -64,7 +78,7 @@ export async function startChat() {
       let currentFinishReason: string | null = null; // 本轮 finish_reason,判停兜底用
       let lastType: "reasoning" | "content" | "tool_calls" | null = null;
       try {
-        for await (const event of sendMessages(history, listDefs())) {
+        for await (const event of sendMessages(history.messages, listDefs())) {
           if (!started) {
             loading.stop();
             // 清除 loading 文本
@@ -132,13 +146,13 @@ export async function startChat() {
           tracer.error("本轮被截断(finish_reason=length),可能上下文过长");
           renderError("模型输出被截断,本轮无完整回答");
           if (answer.trim())
-            history = [...history, { role: "assistant", content: answer }];
+            history.append({ role: "assistant", content: answer });
           break;
         }
         const hasContent = answer.trim().length > 0;
         // 有 content → 正常最终回答,收工
         if (hasContent) {
-          history = [...history, { role: "assistant", content: answer }];
+          history.append({ role: "assistant", content: answer });
           break;
         }
         // 无 content 且无 tool_calls → 空收尾(模型可能只吐了 reasoning 就 finish)。
@@ -150,8 +164,8 @@ export async function startChat() {
           break;
         }
         // 回填本轮空 assistant(保持轮次交替),再注入 nudge user 消息,继续内层 while
-        history = [...history, { role: "assistant", content: answer }];
-        history = [...history, { role: "user", content: NUDGE_TEXT }];
+        history.append({ role: "assistant", content: answer });
+        history.append({ role: "user", content: NUDGE_TEXT });
         tracer.nudge(
           `第 ${emptyRounds} 次 · finish_reason=${currentFinishReason ?? "null"} · reasoningLen=${reasoningLen}`,
         );
@@ -162,10 +176,11 @@ export async function startChat() {
       emptyRounds = 0;
 
       // 有工具调用：先回填 assistant（带 tool_calls）
-      history = [
-        ...history,
-        { role: "assistant", content: answer, tool_calls: toolCallsToRun },
-      ];
+      history.append({
+        role: "assistant",
+        content: answer,
+        tool_calls: toolCallsToRun,
+      });
 
       // 执行每个工具并回填 tool 消息
       for (const tc of toolCallsToRun) {
@@ -196,15 +211,12 @@ export async function startChat() {
 
         tracer.toolResult(tc.function.name, result, ok); // 记工具返回(段事件,带 duration,实时打 🔧 行)
 
-        history = [
-          ...history,
-          {
-            role: "tool",
-            tool_call_id: tc.id,
-            name: tc.function.name,
-            content: result,
-          },
-        ];
+        history.append({
+          role: "tool",
+          tool_call_id: tc.id,
+          name: tc.function.name,
+          content: result,
+        });
       }
     }
 

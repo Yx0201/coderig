@@ -8,7 +8,7 @@ const ak = process.env.API_KEY || "";
 const model = process.env.MODEL || "";
 
 export async function* sendMessages(
-  messages: ChatMessage[],
+  messages: readonly ChatMessage[],
   tools?: ToolDef[],
 ): AsyncGenerator<StreamEvent> {
   // PROMPT_VERSION=none 时 content 为 null → 不注入,跑无系统提示词的基线

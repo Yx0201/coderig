@@ -43,6 +43,7 @@ export interface SessionMeta {
   promptVersion: string; // "none" = 无系统提示词基线;"v1"/"v2" = 实验组
   systemPromptChars: number; // 系统提示词字符数(none 时为 0)
   model: string; // 用的哪个模型,不同模型的 trace 不可比
+  cid?: string; // 关联的对话 id(见 src/history/store.ts)。续话时新 sid 复用旧 cid,靠它把多次 run 关联到同一段对话
 }
 
 // 会话结束时的汇总
