@@ -7,12 +7,18 @@ const endpoint = process.env.ENDPOINT || "";
 const ak = process.env.API_KEY || "";
 const model = process.env.MODEL || "";
 
+// opts.noSystemPrompt:不注入编码助手 sysprompt。
+// 给"辅助性 LLM 调用"用(如 history 摘要):那类调用不是在扮演编码助手,
+// 注入"改代码必须先 read_file / 必须跑 tsc"这类工具纪律只会污染任务
 export async function* sendMessages(
   messages: readonly ChatMessage[],
   tools?: ToolDef[],
+  opts?: { noSystemPrompt?: boolean },
 ): AsyncGenerator<StreamEvent> {
   // PROMPT_VERSION=none 时 content 为 null → 不注入,跑无系统提示词的基线
-  const sys = resolveSystemPrompt();
+  const sys = opts?.noSystemPrompt
+    ? { version: "none", content: null }
+    : resolveSystemPrompt();
   const response = await fetch(`${url}${endpoint}`, {
     method: "POST",
     headers: {

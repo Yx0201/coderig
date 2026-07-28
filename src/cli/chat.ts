@@ -201,54 +201,75 @@ export async function startChat(resumeCid?: string) {
         tool_calls: toolCallsToRun,
       });
 
-      // 并行执行所有工具:执行并发省时,但回填按 tool_calls 原始顺序——
-      // 转录确定性比完成顺序重要(同样的对话重放应产生同样的 transcript)。
-      // 失败(含 handler 意外 throw)一律归一化成"错误："前缀回填,
-      // 由模型看到具体原因后自主决定重试/换参数(errors as observations)
-      const settled = await Promise.allSettled(
-        toolCallsToRun.map(async (tc) => {
-          let args: any = {};
+      // 执行一个工具并记观测。tracer.toolCall/toolResult 都在这里面调——
+      // 紧贴真实开始/结束时刻,duration 才是该工具自己的耗时;
+      // 若挪到批末统一调,每个工具量到的都是"整批耗时",快工具被慢工具污染,
+      // 并行的收益在 trace 里反而看不见
+      const runTool = async (tc: ToolCall) => {
+        let args: any = {};
+        try {
+          args = JSON.parse(tc.function.arguments);
+        } catch {
+          // 参数解析失败是"模型没产出规范 JSON"的信号,必须记下来——
+          // 这是观察提示词是否改善工具纪律的重要指标,不能静默吞掉
+          tracer.error(
+            `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
+          );
+        }
+
+        tracer.toolCall(tc.function.name, args, tc.id); // 记工具调用开始(点事件),带 callId 供并行下配对
+
+        const entry = get(tc.function.name);
+        let result: string;
+        let ok: boolean;
+        if (!entry) {
+          result = `错误：未知工具 ${tc.function.name}`;
+          ok = false;
+        } else {
           try {
-            args = JSON.parse(tc.function.arguments);
-          } catch {
-            // 参数解析失败是"模型没产出规范 JSON"的信号,必须记下来——
-            // 这是观察提示词是否改善工具纪律的重要指标,不能静默吞掉
-            tracer.error(
-              `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
-            );
+            result = await entry.handler(args);
+            // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
+            ok = !result.startsWith("错误");
+          } catch (err) {
+            // handler 意外 throw(工具约定之外的异常)也归一化成"错误："回填,
+            // 保证协议要求的"每个 tool_call_id 必有回应",且失败统计不漏
+            result = `错误：工具执行异常 ${tc.function.name}: ${err instanceof Error ? err.message : String(err)}`;
+            ok = false;
           }
+        }
 
-          tracer.toolCall(tc.function.name, args, tc.id); // 记工具调用开始(点事件),带 callId 供并行下配对
+        tracer.toolResult(tc.function.name, result, ok, tc.id); // 记工具返回(段事件,duration=本工具真实耗时)
+        return result;
+      };
 
-          const entry = get(tc.function.name);
-          if (!entry) {
-            return { result: `错误：未知工具 ${tc.function.name}`, ok: false };
-          }
-          const result = await entry.handler(args);
-          // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
-          return { result, ok: !result.startsWith("错误") };
+      // 只读工具并行、写工具串行:并发省时,但 edit_file/write_file/bash 是
+      // read-modify-write,同一轮并行改同一个文件会互相覆盖(后写的赢,且两次都报成功)——
+      // 这是并行化引入的数据竞争,不是模型的问题,必须在 harness 层挡住。
+      // 写工具按模型给出的原始顺序依次跑,语义与串行版本完全一致
+      const results = new Array<string>(toolCallsToRun.length);
+      const parallelizable: number[] = [];
+      const serial: number[] = [];
+      toolCallsToRun.forEach((tc, i) => {
+        (get(tc.function.name)?.mutates ? serial : parallelizable).push(i);
+      });
+
+      await Promise.all(
+        parallelizable.map(async (i) => {
+          results[i] = await runTool(toolCallsToRun![i]!);
         }),
       );
+      for (const i of serial) {
+        results[i] = await runTool(toolCallsToRun[i]!);
+      }
 
-      settled.forEach((s, i) => {
-        const tc = toolCallsToRun![i]!;
-        // rejected = handler 意外 throw(工具约定之外的异常),也走"错误："口径,
-        // 保证协议要求的"每个 tool_call_id 必有回应",且统计不漏
-        const { result, ok } =
-          s.status === "fulfilled"
-            ? s.value
-            : {
-                result: `错误：工具执行异常 ${tc.function.name}: ${s.reason instanceof Error ? s.reason.message : String(s.reason)}`,
-                ok: false,
-              };
-
-        tracer.toolResult(tc.function.name, result, ok, tc.id); // 记工具返回(段事件,带 duration,实时打 🔧 行)
-
+      // 回填按 tool_calls 原始顺序,与完成顺序无关——
+      // 转录确定性比完成顺序重要(同样的对话重放应产生同样的 transcript)
+      toolCallsToRun.forEach((tc, i) => {
         history.append({
           role: "tool",
           tool_call_id: tc.id,
           name: tc.function.name,
-          content: result,
+          content: results[i]!,
         });
       });
     }

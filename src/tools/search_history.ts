@@ -105,7 +105,14 @@ export const searchHistoryHandler: ToolHandler = async (args) => {
         }
         if (obj.kind !== "msg") continue;
         idx++;
-        const content = obj.content ?? "";
+        // 搜索面要包含 tool_calls:"我之前往哪个文件写了什么"这类问题,
+        // 答案在 arguments 里而不在 content 里(assistant 调工具时 content 常为空)
+        const calls = (obj.tool_calls ?? [])
+          .map((t) => `${t.function.name}(${t.function.arguments})`)
+          .join(" ");
+        const content = calls
+          ? `${obj.content ?? ""}${obj.content ? " " : ""}[调用工具: ${calls}]`
+          : (obj.content ?? "");
         if (!re.test(content)) continue;
         hits.push(`  #${idx} [${obj.role}] ${snippet(content, re)}`);
         total++;

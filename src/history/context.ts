@@ -22,6 +22,11 @@ export interface CompactionState {
 // 压缩时保留的尾部原文预算(字符,粗略对应 2~3k token)。
 // 用字符而非 token:切点只需大致准确,真实触发信号始终是 API 返回的 prompt_tokens
 const TAIL_KEEP_CHARS = 6000;
+// 尾部硬下界:无论预算怎么算,至少留这么多条原文在 tail 里。
+// 对齐 Anthropic context editing 的 keep 语义——只按体积算切点的话,
+// 一条超大消息(读了个大文件、或用户粘了长报错)自己就能吃满预算,
+// 导致切点推到数组末尾、tail 为空,模型只看到摘要看不到当前工作现场
+const MIN_TAIL_MSGS = 6;
 // 视图裁剪:最近 N 条消息完整保留,更早的大工具结果换成占位符
 const KEEP_RECENT = 8;
 // 旧工具结果超过该字符数才裁剪(小结果留着,裁了省不了几个 token 反而丢信息)
@@ -59,22 +64,44 @@ export function shouldCompact(promptTokens: number): boolean {
   return promptTokens > CONTEXT_WINDOW_TOKENS * COMPACT_THRESHOLD;
 }
 
-// 选压缩切点:从末尾往前累计字符,超出尾部预算处即为候选切点,
-// 再向后推进到安全边界——tool 消息不能当 tail 首条(会与它的 assistant(tool_calls) 拆开,
-// 违反"每个 tool 消息前必须有对应 assistant"的协议约束)
+// 一条消息在上下文里的实际体积(字符)。必须把 tool_calls.arguments 算进去——
+// write_file 的 content 是整个文件全文,只数 content 字段的话最大的 token 消耗者
+// 在切点核算里记 0,压缩会以为"尾部很短"从而压不到东西
+function msgChars(m: ChatMessage | undefined): number {
+  if (!m) return 0;
+  let n = m.content?.length ?? 0;
+  for (const tc of m.tool_calls ?? []) {
+    n += tc.function.name.length + tc.function.arguments.length;
+  }
+  return n;
+}
+
+// 选压缩切点:从末尾往前累计字符,超出尾部预算处即为候选切点,再夹到两个安全边界内:
+// 1) 尾部至少留 MIN_TAIL_MSGS 条原文——只按体积算的话一条超大消息就能吃满预算,
+//    把切点推到数组末尾、tail 变空,模型丢掉当前工作现场(读大文件后必然发生);
+// 2) tool 消息不能当 tail 首条(会与它的 assistant(tool_calls) 拆开,
+//    违反"每个 tool 消息前必须有对应 assistant"的协议约束)。
+// 返回值 <= prevCut 表示"无可压的增量",由调用方跳过本次压缩
 export function pickCutIndex(
   msgs: readonly ChatMessage[],
   prevCut: number,
 ): number {
+  // 尾部下界:留够 MIN_TAIL_MSGS 条,切点不能越过这条线
+  const maxCut = msgs.length - MIN_TAIL_MSGS;
+  if (maxCut <= prevCut) return prevCut; // 尾部本身就没超过下界,没什么可压
+
   let cut = prevCut + 1; // 至少压掉一条,保证每次压缩有进展
   let acc = 0;
   for (let i = msgs.length - 1; i > prevCut; i--) {
-    acc += msgs[i]?.content?.length ?? 0;
+    acc += msgChars(msgs[i]);
     if (acc > TAIL_KEEP_CHARS) {
       cut = i + 1;
       break;
     }
   }
+  cut = Math.min(cut, maxCut); // 先夹下界
+  // 再推过 tool 消息保协议。这一步可能越过 maxCut 一两条——
+  // 协议正确性优先于尾部条数,宁可多压一条也不能留下孤儿 tool
   while (cut < msgs.length && msgs[cut]?.role === "tool") cut++;
   return Math.min(cut, msgs.length);
 }
@@ -85,7 +112,12 @@ export function buildContextView(
   msgs: readonly ChatMessage[],
   compaction: CompactionState | null,
 ): ChatMessage[] {
-  const tail = msgs.slice(compaction?.cutIndex ?? 0);
+  let from = compaction?.cutIndex ?? 0;
+  // 防御:tail 不能以 tool 消息开头(它的 assistant(tool_calls) 已被压掉,
+  // 违反"每个 tool 消息前必须有对应 assistant"的协议约束)。pickCutIndex 已保证这点,
+  // 但 cutIndex 也可能来自旧版本转录里的 compaction 行,这里再兜一次
+  while (from < msgs.length && msgs[from]?.role === "tool") from++;
+  const tail = msgs.slice(from);
   const keepFrom = Math.max(0, tail.length - KEEP_RECENT);
   const view = tail.map((m, i) => {
     // 最近的消息原样保留(当前任务的工作现场)
@@ -113,9 +145,11 @@ export function buildContextView(
     // 旧 tool 大结果:裁剪但保留首行(操作摘要)
     if (m.role !== "tool") return m;
     if ((m.content?.length ?? 0) <= TOOL_TRIM_MIN) return m;
-    // 裁剪时保留首行:项目工具约定首行即操作摘要("已修改 path (改动起始行 N)"等),
-    // 行动痕迹(改过哪个文件/哪行)得保住,内容细节可丢——文件系统才是当前状态的事实源,
-    // 需要时重新读取比信任陈旧快照更可靠
+    // 裁剪时保留首行:文件类工具(read_file/write_file/edit_file)首行即操作摘要
+    // ("已修改 path (改动起始行 N)"等),留着就保住了行动痕迹(改过哪个文件/哪行)。
+    // bash/grep 首行只是 stdout/首条命中,留下的是碎片——但下面的占位符已写明
+    // "如需完整内容请重新调用工具",模型不会误以为这就是全部。
+    // 内容细节一律可丢:文件系统才是当前状态的事实源,重新读取比信任陈旧快照可靠
     const firstLine = (m.content.split("\n", 1)[0] ?? "").slice(0, 200);
     return {
       ...m,

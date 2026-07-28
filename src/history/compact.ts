@@ -28,7 +28,9 @@ function lineOf(m: ChatMessage): string {
 }
 
 // 生成新摘要:旧摘要 + 本次被压掉的消息 → 一条新 summary。
-// 不传 tools(摘要任务不该调工具);流式收集 content,忽略 reasoning。
+// 不传 tools(摘要任务不该调工具),也不注入编码助手 sysprompt
+// (那套"改代码先 read_file / 必须跑 tsc"的纪律与摘要任务无关,只会带偏);
+// 流式收集 content,忽略 reasoning。
 // 失败往上抛,由调用方决定降级策略(压缩失败不能搞崩对话主流程)
 export async function summarize(
   prevSummary: string | null,
@@ -44,7 +46,9 @@ export async function summarize(
     },
   ];
   let out = "";
-  for await (const event of sendMessages(input)) {
+  for await (const event of sendMessages(input, undefined, {
+    noSystemPrompt: true,
+  })) {
     if (event.type === "content") out += event.text;
   }
   if (!out.trim()) throw new Error("摘要为空");
