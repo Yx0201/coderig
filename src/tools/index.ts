@@ -6,6 +6,7 @@ import { grepTool } from "./grep.ts";
 import { writeFileTool } from "./write_file.ts";
 import { editFileTool } from "./edit_file.ts";
 import { bashTool } from "./bash.ts";
+import { searchHistoryTool } from "./search_history.ts";
 
 export function setupTools() {
   register(readFileTool);
@@ -15,4 +16,5 @@ export function setupTools() {
   register(writeFileTool);
   register(editFileTool);
   register(bashTool);
+  register(searchHistoryTool);
 }

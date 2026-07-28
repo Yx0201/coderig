@@ -2,6 +2,12 @@ import { appendFile, mkdir, readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ChatMessage } from "../llm/types.ts";
+import {
+  buildContextView,
+  pickCutIndex,
+  type CompactionState,
+} from "./context.ts";
+import { summarize } from "./compact.ts";
 
 // history 与 tracer 是两套独立持久化:
 // - trace.jsonl 记"观测事件"(按 sid 切一次运行),诊断用、会截断;
@@ -20,14 +26,28 @@ export interface HistoryMeta {
   promptVersion: string; // 当时的提示词版本,换 sysprompt 续话也能看出来
 }
 
+// 压缩记录行:压缩发生时追加一条,记录切点和摘要。
+// 转录里的 msg 行永不删改(无损事实层),续话时靠最后一条 compaction 行复现压缩后的视图,
+// 不用重新跑一遍摘要
+export interface HistoryCompaction {
+  v: 1;
+  kind: "compaction";
+  cutIndex: number; // msgs 数组中该位置之前的消息已被 summary 替代
+  summary: string;
+  at: number; // 压缩发生的时间戳
+}
+
 // 消息行:meta 头之外,每行一条。字段就是 ChatMessage 加个 kind 标记
 export type HistoryLine =
   | HistoryMeta
+  | HistoryCompaction
   | ({ kind: "msg" } & ChatMessage);
 
 export class History {
   readonly cid: string;
   private msgs: ChatMessage[] = [];
+  // 压缩状态:null = 从未压缩过。只影响 contextMessages 视图,不影响 msgs/转录
+  private compaction: CompactionState | null = null;
   private readonly path: string;
   // 写盘队列:appendFile 异步,事件密集时并发写会乱序,
   // 用 promise 链串起来,保证文件行序 = append 调用序(与 tracer 同理)
@@ -66,6 +86,9 @@ export class History {
       if (obj.kind === "msg") {
         const { kind: _kind, ...msg } = obj;
         h.msgs.push(msg);
+      } else if (obj.kind === "compaction") {
+        // 后出现的压缩覆盖先前的(每次压缩都已折叠旧摘要,只需最后一条)
+        h.compaction = { cutIndex: obj.cutIndex, summary: obj.summary };
       }
       // meta 头不需要灌进 msgs,它只是元信息
     }
@@ -123,9 +146,31 @@ export class History {
     return out;
   }
 
-  // 暴露只读视图:chat.ts 把它传给 sendMessages,自己不能改它(防止绕过 append 漏落盘)
+  // 暴露只读视图:完整原始消息(事实层),search_history/诊断用
   get messages(): readonly ChatMessage[] {
     return this.msgs;
+  }
+
+  // 发送视图:实际传给 sendMessages 的消息。每次现算——
+  // 压缩过则为 [摘要] + 尾部原文,且旧的大工具结果被裁剪成占位符
+  get contextMessages(): ChatMessage[] {
+    return buildContextView(this.msgs, this.compaction);
+  }
+
+  // 执行一次摘要压缩:选切点 → 调 LLM 摘要(折叠旧摘要) → 更新状态 + 追加转录行。
+  // 触发时机由调用方判断(chat.ts 拿真实 prompt_tokens 对阅值);
+  // 失败往上抛,调用方降级(压不成就带着大上下文继续,不能搞崩对话)
+  async compact(): Promise<{ cutIndex: number; summaryLen: number } | null> {
+    const prevCut = this.compaction?.cutIndex ?? 0;
+    const cutIndex = pickCutIndex(this.msgs, prevCut);
+    if (cutIndex <= prevCut) return null; // 无可压的增量(尾部本身就很短)
+    const summary = await summarize(
+      this.compaction?.summary ?? null,
+      this.msgs.slice(prevCut, cutIndex),
+    );
+    this.compaction = { cutIndex, summary };
+    this.appendLine({ v: 1, kind: "compaction", cutIndex, summary, at: Date.now() });
+    return { cutIndex, summaryLen: summary.length };
   }
 
   // chat.ts 里所有 history = [...history, x] 都改成调这个:

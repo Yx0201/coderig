@@ -7,6 +7,7 @@ import { get, listDefs } from "../tools/registry.ts";
 import { Tracer } from "../observability/tracer.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
 import { History } from "../history/store.ts";
+import { shouldCompact } from "../history/context.ts";
 
 const tracer = new Tracer();
 
@@ -78,7 +79,10 @@ export async function startChat(resumeCid?: string) {
       let currentFinishReason: string | null = null; // 本轮 finish_reason,判停兜底用
       let lastType: "reasoning" | "content" | "tool_calls" | null = null;
       try {
-        for await (const event of sendMessages(history.messages, listDefs())) {
+        for await (const event of sendMessages(
+          history.contextMessages, // 发送视图:压缩/裁剪后的投影,而非完整转录(见 history/context.ts)
+          listDefs(),
+        )) {
           if (!started) {
             loading.stop();
             // 清除 loading 文本
@@ -139,6 +143,21 @@ export async function startChat(resumeCid?: string) {
         if (!started) loading.stop();
       }
 
+      // 上下文压缩检查:用本轮 API 返回的真实 prompt_tokens 对阈值(不做本地估算)。
+      // 放在判停之前:无论下一步是续轮调工具还是等用户新输入,下次请求都用压缩后的视图,
+      // 避免超阈值的大上下文再被原样发一次。压缩失败只记错降级继续,不能搞崩对话
+      if (currentUsage && shouldCompact(currentUsage.prompt_tokens)) {
+        try {
+          const r = await history.compact();
+          if (r)
+            tracer.compaction({ ...r, promptTokens: currentUsage.prompt_tokens });
+        } catch (err) {
+          tracer.error(
+            `上下文压缩失败,降级继续: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
       // 判停 + 执行 + 回填
       if (!toolCallsToRun || toolCallsToRun.length === 0) {
         // finish_reason=length:被截断,nudge 无益(还会被截),记下并终止
@@ -182,34 +201,48 @@ export async function startChat(resumeCid?: string) {
         tool_calls: toolCallsToRun,
       });
 
-      // 执行每个工具并回填 tool 消息
-      for (const tc of toolCallsToRun) {
-        let args: any = {};
-        try {
-          args = JSON.parse(tc.function.arguments);
-        } catch {
-          // 参数解析失败是"模型没产出规范 JSON"的信号,必须记下来——
-          // 这是观察提示词是否改善工具纪律的重要指标,不能静默吞掉
-          tracer.error(
-            `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
-          );
-        }
+      // 并行执行所有工具:执行并发省时,但回填按 tool_calls 原始顺序——
+      // 转录确定性比完成顺序重要(同样的对话重放应产生同样的 transcript)。
+      // 失败(含 handler 意外 throw)一律归一化成"错误："前缀回填,
+      // 由模型看到具体原因后自主决定重试/换参数(errors as observations)
+      const settled = await Promise.allSettled(
+        toolCallsToRun.map(async (tc) => {
+          let args: any = {};
+          try {
+            args = JSON.parse(tc.function.arguments);
+          } catch {
+            // 参数解析失败是"模型没产出规范 JSON"的信号,必须记下来——
+            // 这是观察提示词是否改善工具纪律的重要指标,不能静默吞掉
+            tracer.error(
+              `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
+            );
+          }
 
-        tracer.toolCall(tc.function.name, args); // 记工具调用开始(点事件)
+          tracer.toolCall(tc.function.name, args, tc.id); // 记工具调用开始(点事件),带 callId 供并行下配对
 
-        const entry = get(tc.function.name);
-        let result: string;
-        let ok = true;
-        if (!entry) {
-          result = `错误：未知工具 ${tc.function.name}`;
-          ok = false;
-        } else {
-          result = await entry.handler(args);
+          const entry = get(tc.function.name);
+          if (!entry) {
+            return { result: `错误：未知工具 ${tc.function.name}`, ok: false };
+          }
+          const result = await entry.handler(args);
           // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
-          if (result.startsWith("错误")) ok = false;
-        }
+          return { result, ok: !result.startsWith("错误") };
+        }),
+      );
 
-        tracer.toolResult(tc.function.name, result, ok); // 记工具返回(段事件,带 duration,实时打 🔧 行)
+      settled.forEach((s, i) => {
+        const tc = toolCallsToRun![i]!;
+        // rejected = handler 意外 throw(工具约定之外的异常),也走"错误："口径,
+        // 保证协议要求的"每个 tool_call_id 必有回应",且统计不漏
+        const { result, ok } =
+          s.status === "fulfilled"
+            ? s.value
+            : {
+                result: `错误：工具执行异常 ${tc.function.name}: ${s.reason instanceof Error ? s.reason.message : String(s.reason)}`,
+                ok: false,
+              };
+
+        tracer.toolResult(tc.function.name, result, ok, tc.id); // 记工具返回(段事件,带 duration,实时打 🔧 行)
 
         history.append({
           role: "tool",
@@ -217,7 +250,7 @@ export async function startChat(resumeCid?: string) {
           name: tc.function.name,
           content: result,
         });
-      }
+      });
     }
 
     process.stdout.write("\n"); // 一次对话(可能多轮)结束，换行分隔下一轮 prompt

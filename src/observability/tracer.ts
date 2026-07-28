@@ -18,6 +18,7 @@ export interface TraceEvent {
     | "user_message" // 用户在本会话中发送的一条消息
     | "llm_raw" // 某轮 LLM 返回的原始 SSE data(JSON.parse 前),诊断 think/content 用
     | "nudge" // 空回答兜底:模型本轮无 content/tool_calls,harness 注入续轮提示
+    | "compaction" // 上下文压缩:prompt_tokens 达阈值,旧历史被摘要替代(点事件,带切点/摘要长度)
     | "error"; // 错误
   ts: number; // 相对 session 开始的毫秒
   duration?: number; // 仅段事件有:本段耗时(ms)
@@ -74,8 +75,6 @@ export class Tracer {
   private sessionStart = 0;
   // 本轮 LLM 调用开始的绝对时间戳,llmEnd 算 duration 用
   private roundStartTs = 0;
-  // 当前工具调用开始的绝对时间戳,toolResult 算 duration 用
-  private toolStartTs = 0;
   // 累计的 completion tokens,endSession 汇总用
   private totalCompletionTokens = 0;
   // 累计的 prompt tokens(每轮都重发全量上下文,累加才是真实成本)
@@ -153,33 +152,34 @@ export class Tracer {
     });
   }
 
-  // 工具调用开始:记 tool_call(点事件),args 截断后存,锚定 toolStartTs
-  // 同时记下本次调用的 args 预览,供 toolResult 展示时复用(避免 toolResult 拿不到 args)
-  private lastToolName = "";
-  private lastToolArgsPreview = "";
+  // 工具调用开始:记 tool_call(点事件),args 截断后存。
+  // 并行工具后 toolCall/toolResult 不再严格交替,单一 toolStartTs 会被后发的 toolCall 覆盖,
+  // 改用 callId → {开始时间, args预览} 的映射配对,duration 和 🔧 行的 args 才不会串
+  private toolStarts = new Map<string, { startTs: number; argsPreview: string }>();
 
-  toolCall(name: string, args: unknown) {
-    this.toolStartTs = Date.now();
+  toolCall(name: string, args: unknown, callId: string) {
     this.toolCallCount++;
-    this.lastToolName = name;
-    this.lastToolArgsPreview = this.truncate(args);
-    this.push("tool_call", { name, args: this.lastToolArgsPreview });
+    const argsPreview = this.truncate(args);
+    this.toolStarts.set(callId, { startTs: Date.now(), argsPreview });
+    this.push("tool_call", { name, args: argsPreview });
   }
 
-  // 工具返回:记 tool_result(段事件),duration = 现在 - 该工具调用开始,result 截断
+  // 工具返回:记 tool_result(段事件),duration = 现在 - 该 callId 对应的开始时间,result 截断
   // 实时展示:name(args预览) → result预览 · 耗时,让用户既看到传了啥参数、又看到返回啥
-  toolResult(name: string, result: string, ok: boolean) {
+  toolResult(name: string, result: string, ok: boolean, callId: string) {
     if (!ok) this.toolFailureCount++;
+    const start = this.toolStarts.get(callId);
+    this.toolStarts.delete(callId); // 配对完即清,防 Map 随会话无限增长
     const resultPreview = this.truncate(result);
     const event = this.push("tool_result", {
       name,
       result: resultPreview,
       ok,
-      duration: Date.now() - this.toolStartTs, // 段事件耗时:现在 - toolCall 时锚定的 toolStartTs
+      duration: start ? Date.now() - start.startTs : 0, // 找不到配对(不应发生)时记 0,不致崩
     });
     const dur = event.duration ?? 0;
     process.stdout.write(
-      `\n🔧 ${name}(${this.lastToolArgsPreview}) → ${resultPreview} · ${dur}ms\n`,
+      `\n🔧 ${name}(${start?.argsPreview ?? ""}) → ${resultPreview} · ${dur}ms\n`,
     );
   }
 
@@ -202,6 +202,17 @@ export class Tracer {
   nudge(reason: string) {
     this.push("nudge", { reason });
     process.stdout.write(pc.dim(`\n↻ 续轮提示:模型本轮无回答/无工具调用(${reason}),已注入提示继续\n`));
+  }
+  
+  // 上下文压缩:记切点/摘要长度/触发时的 prompt_tokens,终端打灰色提示。
+  // 这是观察压缩策略好坏的核心事件:压得太勤/摘要太长都靠它看趋势
+  compaction(info: { cutIndex: number; summaryLen: number; promptTokens: number }) {
+    this.push("compaction", info);
+    process.stdout.write(
+      pc.dim(
+        `\n⊘ 上下文压缩:prompt_tokens=${info.promptTokens} 达阈值,前 ${info.cutIndex} 条已折叠为 ${info.summaryLen} 字摘要\n`,
+      ),
+    );
   }
 
   // 错误:记 error 事件
