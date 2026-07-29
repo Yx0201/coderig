@@ -157,9 +157,18 @@ export class History {
     return buildContextView(this.msgs, this.compaction);
   }
 
+  // 当前压缩切点(未压缩过为 0)。chat.ts 用它判断"压不动时尾部还有没有超长消息"
+  get cutIndex(): number {
+    return this.compaction?.cutIndex ?? 0;
+  }
+
   // 执行一次摘要压缩:选切点 → 调 LLM 摘要(折叠旧摘要) → 更新状态 + 追加转录行。
   // 触发时机由调用方判断(chat.ts 拿真实 prompt_tokens 对阅值);
-  // 失败往上抛,调用方降级(压不成就带着大上下文继续,不能搞崩对话)
+  // 失败往上抛,调用方降级(压不成就带着大上下文继续,不能搞崩对话)。
+  //
+  // 返回 null = 没有可压的增量(尾部条数不够或本来就很短)。这不是错误:
+  // 超大单条消息由 buildContextView 的 capContent 就地截断处理,不需要摘要。
+  // 调用方据此区分"已由截断兜住"和"真的压不动",见 chat.ts
   async compact(): Promise<{ cutIndex: number; summaryLen: number } | null> {
     const prevCut = this.compaction?.cutIndex ?? 0;
     const cutIndex = pickCutIndex(this.msgs, prevCut);

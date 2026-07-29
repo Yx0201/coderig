@@ -27,6 +27,15 @@ const TAIL_KEEP_CHARS = 6000;
 // 一条超大消息(读了个大文件、或用户粘了长报错)自己就能吃满预算,
 // 导致切点推到数组末尾、tail 为空,模型只看到摘要看不到当前工作现场
 const MIN_TAIL_MSGS = 6;
+// 单条消息在"发送视图"里允许占的字符上限。超过就地截断(保头保尾)。
+// 这是 MIN_TAIL_MSGS 的必要补充:下界保护的是"条数",但一条 6 万字符的粘贴日志
+// 光自己就能打满窗口——条数够了压不动、体积超了发不出去,会死锁在
+// "跳过压缩 → 原样重发 → 还是超阈值"的循环里,直到 API 报 400 prompt is too long。
+// 上限按尾部预算给,保证 MIN_TAIL_MSGS 条各自截断后总量仍在一个数量级内
+const MSG_HARD_CAP = TAIL_KEEP_CHARS;
+// 就地截断时保留的尾部比例:日志/报错的关键信息(最终 error、栈顶)通常在末尾,
+// 但开头的命令/上下文也要留,所以头尾都留、掐掉中间
+const CAP_TAIL_RATIO = 0.4;
 // 视图裁剪:最近 N 条消息完整保留,更早的大工具结果换成占位符
 const KEEP_RECENT = 8;
 // 旧工具结果超过该字符数才裁剪(小结果留着,裁了省不了几个 token 反而丢信息)
@@ -59,9 +68,33 @@ function trimToolCallArgs(argsStr: string): string {
   }
 }
 
+// 单条超大消息就地截断:头尾都留、掐掉中间,中间插占位符说明丢了多少。
+// 为什么保头保尾:粘贴的日志/报错里,开头是命令与上下文,结尾是最终错误与栈顶,
+// 中间是可丢的重复噪音。opencode 的 truncate 同样按 head/tail 方向保留而非无脑截头
+function capContent(text: string): string {
+  if (text.length <= MSG_HARD_CAP) return text;
+  const tailLen = Math.floor(MSG_HARD_CAP * CAP_TAIL_RATIO);
+  const headLen = MSG_HARD_CAP - tailLen;
+  const dropped = text.length - MSG_HARD_CAP;
+  return `${text.slice(0, headLen)}\n[…中间 ${dropped} 字符已省略:单条消息超过 ${MSG_HARD_CAP} 字符上限,已保留开头与结尾…]\n${text.slice(-tailLen)}`;
+}
+
 // 触发判断:用上一轮 API 返回的真实 prompt_tokens,不做本地估算(分词器不一致,估不准)
 export function shouldCompact(promptTokens: number): boolean {
   return promptTokens > CONTEXT_WINDOW_TOKENS * COMPACT_THRESHOLD;
+}
+
+// 视图里是否还有可回收的空间(超上限的单条消息)。
+// 与 pickCutIndex 配合回答"压缩压不动时,是不是还有别的办法瘦身"——
+// 有就说明 capContent 会生效,不必把这轮当成"无事可做"
+export function hasOversizedMsg(
+  msgs: readonly ChatMessage[],
+  prevCut: number,
+): boolean {
+  for (let i = prevCut; i < msgs.length; i++) {
+    if ((msgs[i]?.content?.length ?? 0) > MSG_HARD_CAP) return true;
+  }
+  return false;
 }
 
 // 一条消息在上下文里的实际体积(字符)。必须把 tool_calls.arguments 算进去——
@@ -120,15 +153,25 @@ export function buildContextView(
   const tail = msgs.slice(from);
   const keepFrom = Math.max(0, tail.length - KEEP_RECENT);
   const view = tail.map((m, i) => {
-    // 最近的消息原样保留(当前任务的工作现场)
-    if (i >= keepFrom) return m;
-    // 旧 assistant 消息:正文(对话主干)不动,只裁 tool_calls 里的超长 arguments
+    // 最近的消息保留原文(当前任务的工作现场),但仍受单条上限约束——
+    // 上限必须对"最近"也生效:超大粘贴恰恰总是最新那条,若豁免它就等于没有上限,
+    // 又会掉回"压缩压不动、体积发不出去"的死锁
+    if (i >= keepFrom) {
+      if ((m.content?.length ?? 0) <= MSG_HARD_CAP) return m;
+      return { ...m, content: capContent(m.content) };
+    }
+    // 旧 assistant 消息:正文(对话主干)只受单条上限约束,
+    // 另外裁 tool_calls 里的超长 arguments
     // (write_file 的 content 是整个文件全文,不裁则每轮都原样重发,是 context 最大头)
     if (m.role === "assistant" && m.tool_calls?.length) {
-      if (!m.tool_calls.some((tc) => tc.function.arguments.length > ARGS_TRIM_MIN))
-        return m;
+      const needArgs = m.tool_calls.some(
+        (tc) => tc.function.arguments.length > ARGS_TRIM_MIN,
+      );
+      const needCap = (m.content?.length ?? 0) > MSG_HARD_CAP;
+      if (!needArgs && !needCap) return m;
       return {
         ...m,
+        content: needCap ? capContent(m.content) : m.content,
         tool_calls: m.tool_calls.map((tc) =>
           tc.function.arguments.length > ARGS_TRIM_MIN
             ? {
@@ -142,8 +185,12 @@ export function buildContextView(
         ),
       };
     }
-    // 旧 tool 大结果:裁剪但保留首行(操作摘要)
-    if (m.role !== "tool") return m;
+    // 旧的非 tool 消息(user 粘贴的长日志、assistant 长正文):只受单条上限约束。
+    // 不做"保留首行"式激进裁剪——对话主干是模型理解任务的依据,不是可重新获取的工具输出
+    if (m.role !== "tool") {
+      if ((m.content?.length ?? 0) <= MSG_HARD_CAP) return m;
+      return { ...m, content: capContent(m.content) };
+    }
     if ((m.content?.length ?? 0) <= TOOL_TRIM_MIN) return m;
     // 裁剪时保留首行:文件类工具(read_file/write_file/edit_file)首行即操作摘要
     // ("已修改 path (改动起始行 N)"等),留着就保住了行动痕迹(改过哪个文件/哪行)。

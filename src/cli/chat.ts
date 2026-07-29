@@ -7,7 +7,11 @@ import { get, listDefs } from "../tools/registry.ts";
 import { Tracer } from "../observability/tracer.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
 import { History } from "../history/store.ts";
-import { shouldCompact } from "../history/context.ts";
+import {
+  shouldCompact,
+  hasOversizedMsg,
+  CONTEXT_WINDOW_TOKENS,
+} from "../history/context.ts";
 
 const tracer = new Tracer();
 
@@ -149,8 +153,24 @@ export async function startChat(resumeCid?: string) {
       if (currentUsage && shouldCompact(currentUsage.prompt_tokens)) {
         try {
           const r = await history.compact();
-          if (r)
+          if (r) {
             tracer.compaction({ ...r, promptTokens: currentUsage.prompt_tokens });
+          } else if (hasOversizedMsg(history.messages, history.cutIndex)) {
+            // 压不动(尾部条数不够 MIN_TAIL_MSGS)但存在超上限的单条消息:
+            // buildContextView 的 capContent 会就地截断,视图仍会瘦下来,不是死锁。
+            // 记一条观测便于事后区分"截断兜住了"和"真的压不动"
+            tracer.error(
+              `压缩无可压增量,但存在超长单条消息,已由单条上限截断兜底(prompt_tokens=${currentUsage.prompt_tokens})`,
+            );
+          } else {
+            // 既压不动、也没有超长单条消息,却仍然超阈值:
+            // 说明尾部就是这么多条中等大小的消息,harness 已无手段可用。
+            // 明确记下来——这是该调大 CONTEXT_WINDOW_TOKENS 或换大窗口模型的信号,
+            // 而不是静默硬发到 API 报 400
+            tracer.error(
+              `上下文超阈值但无可压缩空间(prompt_tokens=${currentUsage.prompt_tokens},预算=${CONTEXT_WINDOW_TOKENS}),建议调大 CONTEXT_WINDOW_TOKENS 或换大窗口模型`,
+            );
+          }
         } catch (err) {
           tracer.error(
             `上下文压缩失败,降级继续: ${err instanceof Error ? err.message : String(err)}`,
