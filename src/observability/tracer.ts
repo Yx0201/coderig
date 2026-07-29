@@ -1,5 +1,4 @@
 import { appendFile, mkdir } from "node:fs/promises";
-import { unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import pc from "picocolors";
 
@@ -94,16 +93,6 @@ export class Tracer {
     this.sessionId = new Date().toISOString().replace(/[:.]/g, "-");
     if (meta) this.meta = meta;
     this.push("session_start", { ...this.meta });
-  }
-
-  // 清空旧日志:每次运行开头调一次,保证本次 trace 是干净的。
-  // 用同步 unlink:必须赶在第一条 startSession 的异步 append 之前完成,否则清空和写入会竞争
-  clearLog() {
-    try {
-      unlinkSync(this.logPath);
-    } catch {
-      // 文件不存在(首次运行)或其它原因,忽略——下次 appendFile 会自动重建
-    }
   }
 
   // 会话结束:Tracer 内部已有全部汇总所需数据(round/sessionStart/各计数器),

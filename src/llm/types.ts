@@ -12,6 +12,12 @@ export interface ChatMessage {
   tool_calls?: ToolCall[]; // 仅 assistant 调工具时存在
   tool_call_id?: string; // 仅 tool 角色消息存在，对上哪次调用
   name?: string; // 仅 tool 角色消息，标记是哪个工具产的结果
+  // 仅 assistant 消息:DeepSeek thinking 模式的推理原文。
+  // DeepSeek 硬约束——带 tool_calls 的 assistant 消息必须在后续所有请求里
+  // 完整回传 reasoning_content,否则 API 直接 400
+  // ("The 'reasoning_content' in the thinking mode must be passed back to the API")。
+  // 无 tool_calls 的普通回答轮则不必存:传了也会被 API 忽略,存了只会胀大转录
+  reasoning_content?: string;
 }
 
 export interface SSEChunk {
@@ -26,7 +32,7 @@ export interface SSEChunk {
     delta?: {
       content?: string;
       role?: Role;
-      reasoning?: string;
+      reasoning_content?: string; // DeepSeek thinking 模式的推理流(官方字段名)
       tool_calls?: {
         index: number;
         id?: string;

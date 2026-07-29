@@ -6,6 +6,11 @@ const url = process.env.BASE_URL || "";
 const endpoint = process.env.ENDPOINT || "";
 const ak = process.env.API_KEY || "";
 const model = process.env.MODEL || "";
+// 单次回答的输出上限(max_tokens)。DeepSeek 官方上限 384K,但不直接顶格:
+// 压缩阈值是窗口的 80%(1M → 800k),顶格 384K 会让 prompt+max_tokens 越过 1M 窗口;
+// 32768 保持"prompt ≤ 80% 窗口 ⇒ prompt + max_tokens ≤ 窗口"的不变量,
+// 对正常回答也绰绰有余。计费按实际生成量,不按声明值
+const maxTokens = Number(process.env.MAX_OUTPUT_TOKENS || 32768);
 
 // opts.noSystemPrompt:不注入编码助手 sysprompt。
 // 给"辅助性 LLM 调用"用(如 history 摘要):那类调用不是在扮演编码助手,
@@ -31,6 +36,7 @@ export async function* sendMessages(
         ? [{ role: "system", content: sys.content }, ...messages]
         : messages,
       tools,
+      max_tokens: maxTokens,
       stream: true,
       stream_options: { include_usage: true }, // 让流式最后一个 chunk 携带 token 用量
     }),
@@ -61,7 +67,8 @@ export async function* sendMessages(
     if (choice?.finish_reason) finishReason = choice.finish_reason;
     const delta = choice?.delta;
     if (delta?.content) yield { type: "content", text: delta.content };
-    if (delta?.reasoning) yield { type: "reasoning", text: delta.reasoning };
+    if (delta?.reasoning_content)
+      yield { type: "reasoning", text: delta.reasoning_content };
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         // 取出该 index 的槽，没有就建一个空槽

@@ -6,8 +6,10 @@
 
 ## 0. 项目定位
 
-coderig 是一个**学习用**的 mini agent harness:终端 CLI + 工具系统 + 可观测性(tracer),
-后端是 ollama 跑的本地小模型(qwen3.5:4b)。
+coderig 是一个**学习用**的 mini agent harness:终端 CLI + 工具系统 + 可观测性(tracer)。
+后端已于 2026-07-29 从 ollama 本地小模型(qwen3.5:4b)切换为 DeepSeek 云端 API
+(1M 窗口,thinking 模式——带 tool_calls 的 assistant 消息必须回传 reasoning_content,
+这是 DeepSeek 的协议硬约束,不是模型偏好)。
 
 它不是产品,是"自己实现一遍 Claude Code 的核心机制"的练习场。架构和教学性优先于功能完整度。
 
@@ -58,9 +60,9 @@ Claude Opus / GPT-5.x 这类)。因此:
 
 ## 3. 可观测性约定
 
-- `logs/trace.jsonl` 每次 `startChat()` 开头清空(`tracer.clearLog()`),一次运行 = 一份干净日志。
-  理由:骨架阶段(history/渲染/上下文压缩等)还在大改,每次改动要看的是本次行为,
-  跨运行累积的 A/B 对比留到 sysprompt 专门优化阶段再开。每条事件仍带 `sid`,单次运行内靠它不丢。
+- `logs/trace.jsonl` 跨运行累积(2026-07-29 起,骨架阶段已过,进入 sysprompt A/B 阶段)。
+  一次运行 = 一个 `sid`,靠每条事件的 `sid` 切出单次运行做前后对比;
+  要重开一份干净日志时手动删除该文件,代码不再自动清。
 - 每条事件带 `sid` + `seq` + `round` + `ts`。
 - `session_start` 记实验元数据:`promptVersion` / `systemPromptChars` / `model`。
   改 sysprompt 就升 `PROMPT_VERSION`(`src/prompts/system.ts`),前后对比全靠它。

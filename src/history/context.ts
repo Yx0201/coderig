@@ -6,11 +6,13 @@ import type { ChatMessage } from "../llm/types.ts";
 // 这里只负责从原始 msgs 组装"发送视图"——一个受窗口约束的有损投影。
 // 视图 = [摘要消息(若压缩过)] + 尾部原文(旧的大工具结果/超长工具参数被裁剪成占位符)。
 
-// 模型上下文窗口预算(token)。ollama 的 num_ctx 往往远小于模型标称窗口,按实际配置填
+// 模型上下文窗口预算(token)。DeepSeek 官方窗口 1M token;
+// 压缩触发阈值见 COMPACT_THRESHOLD(80% 即 800k 触发,余量留给输出)
 export const CONTEXT_WINDOW_TOKENS = Number(
-  process.env.CONTEXT_WINDOW_TOKENS || 8192,
+  process.env.CONTEXT_WINDOW_TOKENS || 1_000_000,
 );
-// 压缩触发阈值:不贴着窗口上限,80% 就触发——既留输出空间,也避开长上下文注意力稀释区
+// 压缩触发阈值:不贴着窗口上限,80% 就触发——1M 窗口下留出 200k token 输出余量
+// (覆盖 MAX_OUTPUT_TOKENS 缺省 32768 数倍),同时避开超长上下文的注意力稀释区
 export const COMPACT_THRESHOLD = 0.8;
 
 // 压缩状态:cutIndex 之前的消息已被 summary 替代(索引指向原始 msgs 数组)
@@ -19,17 +21,19 @@ export interface CompactionState {
   summary: string;
 }
 
-// 压缩时保留的尾部原文预算(字符,粗略对应 2~3k token)。
-// 用字符而非 token:切点只需大致准确,真实触发信号始终是 API 返回的 prompt_tokens
-const TAIL_KEEP_CHARS = 6000;
+// 压缩时保留的尾部原文预算(字符,约 40k+ token)。
+// 用字符而非 token:切点只需大致准确,真实触发信号始终是 API 返回的 prompt_tokens。
+// 1M 窗口下没必要像小窗口时代那样只留 6k——压缩的目的是摘掉陈旧的远期历史,
+// 当前工作现场(近几十轮原文)留得越完整,摘要信息损耗的影响越小
+const TAIL_KEEP_CHARS = 150_000;
 // 尾部硬下界:无论预算怎么算,至少留这么多条原文在 tail 里。
 // 对齐 Anthropic context editing 的 keep 语义——只按体积算切点的话,
 // 一条超大消息(读了个大文件、或用户粘了长报错)自己就能吃满预算,
 // 导致切点推到数组末尾、tail 为空,模型只看到摘要看不到当前工作现场
 const MIN_TAIL_MSGS = 6;
 // 单条消息在"发送视图"里允许占的字符上限。超过就地截断(保头保尾)。
-// 这是 MIN_TAIL_MSGS 的必要补充:下界保护的是"条数",但一条 6 万字符的粘贴日志
-// 光自己就能打满窗口——条数够了压不动、体积超了发不出去,会死锁在
+// 这是 MIN_TAIL_MSGS 的必要补充:下界保护的是"条数",但一条数百 KB 的粘贴日志
+// 光自己就能吃掉尾部预算——条数够了压不动、体积超了发不出去,会死锁在
 // "跳过压缩 → 原样重发 → 还是超阈值"的循环里,直到 API 报 400 prompt is too long。
 // 上限按尾部预算给,保证 MIN_TAIL_MSGS 条各自截断后总量仍在一个数量级内
 const MSG_HARD_CAP = TAIL_KEEP_CHARS;
@@ -38,15 +42,16 @@ const MSG_HARD_CAP = TAIL_KEEP_CHARS;
 const CAP_TAIL_RATIO = 0.4;
 // 视图裁剪:最近 N 条消息完整保留,更早的大工具结果换成占位符
 const KEEP_RECENT = 8;
-// 旧工具结果超过该字符数才裁剪(小结果留着,裁了省不了几个 token 反而丢信息)
-const TOOL_TRIM_MIN = 400;
+// 旧工具结果超过该字符数才裁剪。1M 窗口下中小结果(一次 grep、一个小文件)
+// 留着不疼,裁了反而丢细节;只有大文件读取/长日志这类真正占体积的才裁
+const TOOL_TRIM_MIN = 8000;
 // 旧 assistant 消息里单条 tool_calls.arguments 超过该长度才处理。
 // 对齐 Anthropic context editing 的 clear_tool_inputs 语义,但更保守:
 // 大多数工具参数很短(路径/pattern),清了省不了几个 token 还丢行动记录;
 // 只有 write_file.content 这类携带全文的超长参数才值得裁
-const ARGS_TRIM_MIN = 400;
-// 参数对象里单个字符串字段超过该长度才置换(path 等短字段原样保留)
-const ARG_FIELD_MAX = 200;
+const ARGS_TRIM_MIN = 8000;
+// 参数对象里单个字符串字段超过该长度才置换(path/短片段原样保留)
+const ARG_FIELD_MAX = 1000;
 
 // 裁剪一条超长的 arguments:解析 JSON 后逐字段处理——短字段保留(行动痕迹),
 // 长字段换占位符(内容已落到文件系统,read_file 可取回当前状态,陈旧快照不值得占窗口)。
@@ -99,10 +104,12 @@ export function hasOversizedMsg(
 
 // 一条消息在上下文里的实际体积(字符)。必须把 tool_calls.arguments 算进去——
 // write_file 的 content 是整个文件全文,只数 content 字段的话最大的 token 消耗者
-// 在切点核算里记 0,压缩会以为"尾部很短"从而压不到东西
+// 在切点核算里记 0,压缩会以为"尾部很短"从而压不到东西。
+// reasoning_content 同理:DeepSeek 要求它随 tool_calls 消息一起回传,
+// 它是请求报文的真实体积,长推理一轮就能上万字符
 function msgChars(m: ChatMessage | undefined): number {
   if (!m) return 0;
-  let n = m.content?.length ?? 0;
+  let n = (m.content?.length ?? 0) + (m.reasoning_content?.length ?? 0);
   for (const tc of m.tool_calls ?? []) {
     n += tc.function.name.length + tc.function.arguments.length;
   }

@@ -18,7 +18,8 @@ const tracer = new Tracer();
 // 续话:传一个已有 cid,把那段对话的转录灌回内存接着聊;
 // 不传则新开一段对话。两种情况都各自记一份观测(trace 的新 sid),但 cid 跨续话保持不变
 export async function startChat(resumeCid?: string) {
-  tracer.clearLog(); // 每次运行开头清空旧日志,本次 trace 干净(见 CLAUDE.md 观测约定)
+  // 不再每次清空 trace:骨架阶段已过,进入 sysprompt A/B 阶段,
+  // 日志跨运行累积,靠每条事件的 sid 切出单次运行做前后对比(见 CLAUDE.md 观测约定)
   const sys = resolveSystemPrompt();
   const model = process.env.MODEL || "?";
 
@@ -74,6 +75,7 @@ export async function startChat(resumeCid?: string) {
       tracer.nextRound();
       tracer.llmStart();
       let answer = "";
+      let reasoning = ""; // 本轮推理原文:带 tool_calls 的 assistant 消息必须原样存回 history
       loading.start();
       let started = false;
       let toolCallsToRun: ToolCall[] | null = null;
@@ -113,6 +115,7 @@ export async function startChat(resumeCid?: string) {
               break;
             case "reasoning":
               process.stdout.write(pc.dim(event.text));
+              reasoning += event.text;
               reasoningLen += event.text.length;
               break;
             case "tool_calls":
@@ -214,11 +217,14 @@ export async function startChat(resumeCid?: string) {
       // 走到这里说明有工具调用:模型本轮有产出,空回答计数归零
       emptyRounds = 0;
 
-      // 有工具调用：先回填 assistant（带 tool_calls）
+      // 有工具调用：先回填 assistant（带 tool_calls + reasoning_content）。
+      // reasoning_content 是 DeepSeek thinking 模式的硬协议:缺了它,
+      // 下一轮请求直接 400——它不是"可选的思考记录",是请求报文的一部分
       history.append({
         role: "assistant",
         content: answer,
         tool_calls: toolCallsToRun,
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
       });
 
       // 执行一个工具并记观测。tracer.toolCall/toolResult 都在这里面调——
