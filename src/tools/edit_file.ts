@@ -126,4 +126,9 @@ export const editFileHandler: ToolHandler = async (args) => {
   }
 };
 
-export const editFileTool = { def: editFileDef, handler: editFileHandler };
+// mutates:read-modify-write,并行两次改同一文件会互相覆盖(见 registry.ts)
+export const editFileTool = {
+  def: editFileDef,
+  handler: editFileHandler,
+  mutates: true,
+};

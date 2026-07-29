@@ -78,4 +78,5 @@ export const bashHandler: ToolHandler = async (args) => {
   }
 };
 
-export const bashTool = { def: bashDef, handler: bashHandler };
+// mutates:命令可能改任何东西(git/构建/删文件),不能与其它写并行(见 registry.ts)
+export const bashTool = { def: bashDef, handler: bashHandler, mutates: true };

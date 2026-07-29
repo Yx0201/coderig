@@ -43,4 +43,9 @@ export const writeFileHandler: ToolHandler = async (args) => {
   }
 };
 
-export const writeFileTool = { def: writeFileDef, handler: writeFileHandler };
+// mutates:写文件改外部状态,不能与其它写并行(见 registry.ts)
+export const writeFileTool = {
+  def: writeFileDef,
+  handler: writeFileHandler,
+  mutates: true,
+};
