@@ -146,6 +146,32 @@ export function pickCutIndex(
   return Math.min(cut, msgs.length);
 }
 
+// 补齐未回应的 tool_calls。上次运行在"工具执行中"被 ctrl+C/崩溃打断时,
+// assistant(tool_calls) 已落盘、tool 结果还没写,续话 load 后这对就是断的——
+// 发出去 API 直接 400(每个 tool_calls 必须有对应的 tool 消息回应)。
+// 转录是无损事实层不能改,所以在视图层补一条合成的 tool 消息:
+// 内容说明"未执行完",模型据此知道该重试而不是当成已完成
+function fillMissingToolResponses(view: ChatMessage[]): ChatMessage[] {
+  const responded = new Set<string>();
+  for (const m of view) if (m.role === "tool" && m.tool_call_id) responded.add(m.tool_call_id);
+
+  const out: ChatMessage[] = [];
+  for (const m of view) {
+    out.push(m);
+    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+    for (const tc of m.tool_calls) {
+      if (responded.has(tc.id)) continue;
+      out.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        name: tc.function.name,
+        content: "错误：该工具调用未完成(上次运行被中断),结果不可用。如仍需要请重新调用",
+      });
+    }
+  }
+  return out;
+}
+
 // 组装发送视图:压缩状态 + 原始消息 → 实际传给 sendMessages 的数组。
 // 每次调用现算,不缓存——msgs 和压缩状态都可能变,视图必须永远反映最新事实
 export function buildContextView(
@@ -210,11 +236,14 @@ export function buildContextView(
       content: `${firstLine}\n[其余 ${m.content.length - firstLine.length} 字符已裁剪:${m.name ?? "?"} 的旧结果。如需完整内容,请重新调用工具获取当前状态]`,
     };
   });
+  // 补齐断掉的 tool_calls(续话遇上次被中断的转录),再挂摘要。
+  // 顺序重要:补齐要在 unshift 摘要之前做,合成的 tool 消息必须紧跟它的 assistant
+  const filled = fillMissingToolResponses(view);
   if (compaction) {
-    view.unshift({
+    filled.unshift({
       role: "user",
       content: `[历史对话摘要——以下是本对话更早内容的压缩总结,原文已省略]\n${compaction.summary}`,
     });
   }
-  return view;
+  return filled;
 }

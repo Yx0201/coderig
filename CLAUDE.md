@@ -51,6 +51,9 @@ Claude Opus / GPT-5.x 这类)。因此:
 - TypeScript,跑在 Bun 上。项目去 Bun 依赖的地方就用 `node:fs/promises` 这类可移植原生 API。
 - 新工具加在 `src/tools/`,遵循 `def` + `handler` + 导出 `{ def, handler }` 的约定,
   失败统一返回 `"错误："` 前缀(被 tracer 据此判 `ok`)。注册到 `src/tools/index.ts`。
+- 工具执行前必须过权限门(`src/tools/permissions.ts`):auto/ask/deny 三级,
+  mutating 工具默认询问,危险命令与敏感路径不可会话放行(rememberable=false);
+  用户的选择记 `approval` 事件。新增 mutating 工具时在 checkPermission 里补一条分支。
 - 观测全走 `src/observability/tracer.ts`:新事件类型加进 `TraceEvent.type`,加对应方法,
   落盘靠 `push()`(已串行化写盘,保证行序=事件序)。不要在底层(stream.ts 等)直接塞 tracer,
   观测数据顺着 StreamEvent 管道流到 chat.ts 再调 tracer。

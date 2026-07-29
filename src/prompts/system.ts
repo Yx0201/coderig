@@ -1,6 +1,8 @@
-export const PROMPT_VERSION = "v2"; // 每次改提示词就升版本,trace 对比全靠它
+export const PROMPT_VERSION = "v3"; // 每次改提示词就升版本,trace 对比全靠它
 // v2: 适配 bash 工具 —— 新增"改完代码必须验证"纪律(小模型不会自发跑 tsc,必须写明),
 //     bash 与文件工具的分工,以及"不读大文件"规则(v1 实验中一次读日志把上下文撑大 5 倍)
+// v3: 寒暄不探索 —— 换 DeepSeek 后模型过度主动:用户只发"你好"就把项目文件读一遍,
+//     白烧近万 token。补上"什么时候不该用工具"的边界(v2 只有该怎么用的纪律)
 
 export function buildSystemPrompt(): string {
   return [
@@ -8,6 +10,7 @@ export function buildSystemPrompt(): string {
     `当前工作目录: ${process.cwd()}`,
     `今天日期: ${new Date().toISOString().slice(0, 10)}`,
     "工具使用规则:",
+    "- 用户只是打招呼、闲聊或问与项目无关的问题时,直接简短回答,不要调用工具探索项目",
     "- 修改文件前必须先 read_file 确认内容",
     "- edit_file 的 oldString 必须在文件中唯一匹配",
     "- 找文件用 glob,找内容用 grep,不要靠猜路径",

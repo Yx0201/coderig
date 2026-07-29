@@ -59,6 +59,12 @@ export type StreamEvent =
   | { type: "tool_calls"; tool_calls: ToolCall[] }
   | { type: "usage"; usage: TokenUsage }
   | { type: "finish"; finish_reason: string | null } // 本轮 finish_reason(stop/tool_calls/length/null),判停兜底用
+  // 工具参数流式生成中的进度(节流:每 512 字符或首次知名一次)。
+  // write_file 的 content 是整文件全文,生成十几秒期间若无任何输出,用户会以为卡死
+  | { type: "tool_call_progress"; name?: string; argsChars: number }
+  // 请求级重试:429/5xx/网络错误时,sendMessages 在重发前 yield 一次。
+  // 底层不直接碰 tracer(CLAUDE.md 观测约定),重试事实顺管道流到 chat.ts 再落盘
+  | { type: "retry"; attempt: number; maxAttempts: number; delayMs: number; reason: string }
   | { type: "raw"; data: string }; // 本轮所有 SSE 的原始 data(JSON.parse 前),诊断 LLM 实际输出用
 
 export interface ToolDef {

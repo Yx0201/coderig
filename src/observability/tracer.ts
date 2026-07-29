@@ -18,6 +18,8 @@ export interface TraceEvent {
     | "llm_raw" // 某轮 LLM 返回的原始 SSE data(JSON.parse 前),诊断 think/content 用
     | "nudge" // 空回答兜底:模型本轮无 content/tool_calls,harness 注入续轮提示
     | "compaction" // 上下文压缩:prompt_tokens 达阈值,旧历史被摘要替代(点事件,带切点/摘要长度)
+    | "approval" // 权限门:一次人工确认(允许/会话放行/拒绝),A/B 时看模型尝试危险操作的频率
+    | "retry" // LLM 请求重试:云端 API 抖动(429/5xx/网络错误),带次数/退避时长/原因
     | "error"; // 错误
   ts: number; // 相对 session 开始的毫秒
   duration?: number; // 仅段事件有:本段耗时(ms)
@@ -153,6 +155,14 @@ export class Tracer {
     this.push("tool_call", { name, args: argsPreview });
   }
 
+  // 权限确认通过后重新锚定开始时间。用户看确认框的耗时不是工具执行耗时——
+  // 不重置的话 tool_result 的 duration 会把人的犹豫算进工具耗时
+  // (实测:write_file 实际执行 4ms,trace 里记了 11.8s,全是等用户点确认的时间)
+  toolApproved(callId: string) {
+    const s = this.toolStarts.get(callId);
+    if (s) this.toolStarts.set(callId, { ...s, startTs: Date.now() });
+  }
+
   // 工具返回:记 tool_result(段事件),duration = 现在 - 该 callId 对应的开始时间,result 截断
   // 实时展示:name(args预览) → result预览 · 耗时,让用户既看到传了啥参数、又看到返回啥
   toolResult(name: string, result: string, ok: boolean, callId: string) {
@@ -202,6 +212,28 @@ export class Tracer {
         `\n⊘ 上下文压缩:prompt_tokens=${info.promptTokens} 达阈值,前 ${info.cutIndex} 条已折叠为 ${info.summaryLen} 字摘要\n`,
       ),
     );
+  }
+
+  // 权限门:只在"问了用户"或"硬禁止"时记——auto 放行是主流路径,记了全是噪音。
+  // A/B 时按 sid 统计 approval 事件密度,看提示词是否影响模型尝试危险操作的频率
+  approval(info: {
+    tool: string;
+    action: "ask" | "deny"; // ask=问了用户,deny=安全策略硬禁
+    decision: "allow" | "session_allow" | "deny"; // 用户/策略的最终决定
+    reason: string;
+  }) {
+    this.push("approval", info);
+  }
+
+  // LLM 请求重试:云端 API 的抖动(429/5xx/网络错误)是切换云端后新出现的失败面。
+  // 逐次记下来,事后能看到"哪家供应商什么时段不稳",而不是只看到最终的失败
+  retry(info: {
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    reason: string;
+  }) {
+    this.push("retry", info);
   }
 
   // 错误:记 error 事件

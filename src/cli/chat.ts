@@ -4,6 +4,7 @@ import type { ChatMessage, ToolCall } from "../llm/types.ts";
 import { sendMessages } from "../llm/client.ts";
 import pc from "picocolors";
 import { get, listDefs } from "../tools/registry.ts";
+import { checkPermission } from "../tools/permissions.ts";
 import { Tracer } from "../observability/tracer.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
 import { History } from "../history/store.ts";
@@ -42,6 +43,10 @@ export async function startChat(resumeCid?: string) {
   );
 
   const loading = renderLoading();
+  // 会话级权限放行名单:用户在确认提示里选"本会话不再询问 X"时加入。
+  // 只记工具名粒度(bash/write_file/edit_file);危险命令与敏感路径不可放行,
+  // 由 permissions.ts 的 rememberable=false 保证进不了这个集合
+  const sessionAllows = new Set<string>();
 
   while (true) {
     const input = await p.text({
@@ -84,6 +89,9 @@ export async function startChat(resumeCid?: string) {
       let currentUsage: any;
       let currentFinishReason: string | null = null; // 本轮 finish_reason,判停兜底用
       let lastType: "reasoning" | "content" | "tool_calls" | null = null;
+      // 工具参数进度行是否已占一行:首个进度事件先换行(不盖住在流的 reasoning),
+      // 后续进度用 \r 原地刷新;content/reasoning 到来时复位
+      let progressActive = false;
       try {
         for await (const event of sendMessages(
           history.contextMessages, // 发送视图:压缩/裁剪后的投影,而非完整转录(见 history/context.ts)
@@ -100,20 +108,24 @@ export async function startChat(resumeCid?: string) {
           if (event.type === "content" && lastType === "reasoning") {
             process.stdout.write("\n"); // 思考→回答 切换，换行分隔
           }
-          // raw/finish 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
+          // raw/finish/retry/tool_call_progress 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
           if (
             event.type !== "usage" &&
             event.type !== "raw" &&
-            event.type !== "finish"
+            event.type !== "finish" &&
+            event.type !== "retry" &&
+            event.type !== "tool_call_progress"
           )
             lastType = event.type;
           switch (event.type) {
             case "content":
+              progressActive = false;
               process.stdout.write(event.text);
               answer += event.text;
               contentLen += event.text.length;
               break;
             case "reasoning":
+              progressActive = false;
               process.stdout.write(pc.dim(event.text));
               reasoning += event.text;
               reasoningLen += event.text.length;
@@ -129,6 +141,30 @@ export async function startChat(resumeCid?: string) {
               break;
             case "raw":
               tracer.llmRaw(event.data); // 本轮原始 SSE 报文落盘,诊断 think/content 用
+              break;
+            case "retry":
+              // 云端 API 抖动,client 层退避后将自动重发。落盘 + 终端提示,
+              // 让用户知道"卡住"是在等退避,而不是程序死了
+              tracer.retry(event);
+              process.stdout.write(
+                pc.dim(
+                  `\n⟳ 请求失败(${(event.reason ?? "").slice(0, 120)}),${(event.delayMs / 1000).toFixed(1)}s 后重试(${event.attempt}/${event.maxAttempts})\n`,
+                ),
+              );
+              break;
+            case "tool_call_progress":
+              // 模型正在流式生成工具参数(write_file 写整文件时可达十几秒)。
+              // 首个进度先换行(不盖住正在流的 reasoning),之后 \r 原地刷新一行
+              if (!progressActive) {
+                process.stdout.write("\n");
+                progressActive = true;
+              }
+              process.stdout.write(
+                `\r${" ".repeat(60)}\r` +
+                  pc.dim(
+                    `⏳ 正在生成 ${event.name ?? "工具调用"} 的参数… ${event.argsChars} 字符`,
+                  ),
+              );
               break;
           }
         }
@@ -154,6 +190,8 @@ export async function startChat(resumeCid?: string) {
       // 放在判停之前:无论下一步是续轮调工具还是等用户新输入,下次请求都用压缩后的视图,
       // 避免超阈值的大上下文再被原样发一次。压缩失败只记错降级继续,不能搞崩对话
       if (currentUsage && shouldCompact(currentUsage.prompt_tokens)) {
+        // 压缩要调一次 LLM 生成摘要,可能几秒——先打一行,别让用户以为卡死
+        process.stdout.write(pc.dim("\n⊘ 正在压缩上下文(调用模型生成摘要)…\n"));
         try {
           const r = await history.compact();
           if (r) {
@@ -252,15 +290,86 @@ export async function startChat(resumeCid?: string) {
           result = `错误：未知工具 ${tc.function.name}`;
           ok = false;
         } else {
-          try {
-            result = await entry.handler(args);
-            // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
-            ok = !result.startsWith("错误");
-          } catch (err) {
-            // handler 意外 throw(工具约定之外的异常)也归一化成"错误："回填,
-            // 保证协议要求的"每个 tool_call_id 必有回应",且失败统计不漏
-            result = `错误：工具执行异常 ${tc.function.name}: ${err instanceof Error ? err.message : String(err)}`;
+          // 权限门:handler 执行前分级。auto 直接放行;deny 硬禁不问;
+          // ask 弹确认(可记会话放行名单)。被拒绝/禁止也走正常 toolResult 回填——
+          // 协议要求每个 tool_call_id 必有回应,且"模型尝试了什么"必须在转录里留痕
+          const perm = checkPermission(tc.function.name, args, sessionAllows);
+          let allowed = perm.action === "auto";
+          if (perm.action === "deny") {
+            tracer.approval({
+              tool: tc.function.name,
+              action: "deny",
+              decision: "deny",
+              reason: perm.reason,
+            });
+            process.stdout.write(pc.red(`\n⛔ 已阻止: ${perm.reason}\n`));
+          } else if (perm.action === "ask") {
+            // 注意:会走到这里的只有写工具(只读工具全部 auto),而写工具是串行执行的,
+            // 不存在多个确认框并发的问题(见下方 parallelizable/serial 的划分)
+            const choice = await p.select({
+              message: `⚠ 模型请求: ${perm.reason}`,
+              options: [
+                { value: "allow" as const, label: "允许一次" },
+                ...(perm.rememberable
+                  ? [
+                      {
+                        value: "session" as const,
+                        label: `本会话不再询问 ${tc.function.name}`,
+                      },
+                    ]
+                  : []),
+                { value: "deny" as const, label: "拒绝" },
+              ],
+            });
+            if (p.isCancel(choice) || choice === "deny") {
+              tracer.approval({
+                tool: tc.function.name,
+                action: "ask",
+                decision: "deny",
+                reason: perm.reason,
+              });
+            } else {
+              allowed = true;
+              if (choice === "session") sessionAllows.add(tc.function.name);
+              tracer.approval({
+                tool: tc.function.name,
+                action: "ask",
+                decision: choice === "session" ? "session_allow" : "allow",
+                reason: perm.reason,
+              });
+            }
+          }
+
+          if (!allowed) {
+            // 拒绝文案要点:明确告诉模型"不要换皮重试同一操作"——
+            // 否则模型常把 rm 换成 mv、把被拒的命令拆成多步绕道达成,
+            // 权限门就形同虚设。让用户先表态,模型再行动
+            result =
+              perm.action === "deny"
+                ? `错误：该操作被安全策略硬禁止(${perm.reason})。请改用其它思路,或告知用户需要手动处理`
+                : `错误：用户拒绝了本次操作。不要换种方式重试同一意图;请先在回复中说明你想做什么、征得用户同意后再继续`;
             ok = false;
+          } else {
+            // 重新锚定计时起点:权限确认等用户的耗时不能算进工具耗时
+            // (实测 write_file 执行 4ms 被记成 11.8s,全是用户看确认框的时间)
+            tracer.toolApproved(tc.id);
+            // 慢工具提示:300ms 内跑完的不打扰(read_file 就几毫秒,提示反而是噪音);
+            // 超过才打一行"执行中"(bash tsc 要几秒,静默期会让用户以为卡死)
+            const slowTimer = setTimeout(() => {
+              process.stdout.write(pc.dim(`⏳ ${tc.function.name} 执行中…\n`));
+            }, 300);
+            try {
+              result = await entry.handler(args);
+              // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
+              ok = !result.startsWith("错误");
+            } catch (err) {
+              // handler 意外 throw(工具约定之外的异常)也归一化成"错误："回填,
+              // 保证协议要求的"每个 tool_call_id 必有回应",且失败统计不漏
+              result = `错误：工具执行异常 ${tc.function.name}: ${err instanceof Error ? err.message : String(err)}`;
+              ok = false;
+            } finally {
+              clearTimeout(slowTimer);
+            }
           }
         }
 
