@@ -137,6 +137,54 @@ test("连续压缩单调推进(prevCut 之后每次都有进展或明确无进�
   }
 });
 
+test("续话遇上次被中断的转录:未回应的 tool_calls 在视图层被补齐", () => {
+  // 上次运行在"工具执行中"被 ctrl+C/崩溃打断:assistant(tool_calls) 已落盘、
+  // tool 结果还没写。续话原样发出去 API 直接 400
+  const msgs = [user("读文件"), asstCall("call_1"), user("续话后的新问题")];
+  const view = buildContextView(msgs, null);
+  assertProtocolValid(view);
+  const synth = view.find((m) => m.role === "tool" && m.tool_call_id === "call_1")!;
+  expect(synth).toBeTruthy();
+  expect(synth.content).toContain("未完成"); // 明确告知模型该重试,而非当成已完成
+  // 合成的 tool 必须紧跟它的 assistant,不能被挤到末尾
+  const ai = view.findIndex((m) => m.tool_calls?.length);
+  expect(view[ai + 1]).toBe(synth);
+});
+
+test("一个 assistant 多个 tool_calls 只断了一部分:只补缺的那些", () => {
+  const msgs: ChatMessage[] = [
+    user("并行读两个文件"),
+    {
+      role: "assistant",
+      content: "",
+      reasoning_content: "并行读",
+      tool_calls: [
+        { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } },
+        { id: "c2", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ],
+    },
+    toolRes("c1", "第一个的结果"), // c2 的结果缺失(进程在这里被打断)
+  ];
+  const view = buildContextView(msgs, null);
+  assertProtocolValid(view);
+  const c1 = view.filter((m) => m.tool_call_id === "c1");
+  const c2 = view.filter((m) => m.tool_call_id === "c2");
+  expect(c1.length).toBe(1); // 已有的不重复补
+  expect(c1[0]!.content).toBe("第一个的结果"); // 且原文不被改写
+  expect(c2.length).toBe(1); // 缺的补上
+  expect(c2[0]!.content).toContain("未完成");
+});
+
+test("压缩 + 断连同时发生:摘要在最前,合成 tool 仍紧跟其 assistant", () => {
+  const msgs: ChatMessage[] = [
+    ...Array.from({ length: 10 }, (_, i) => user(`早期 ${i}`)),
+    asstCall("call_x"), // 尾部有个断掉的调用
+  ];
+  const view = buildContextView(msgs, { cutIndex: 8, summary: "早期摘要" });
+  expect(view[0]!.content).toContain("早期摘要"); // 摘要仍在最前
+  assertProtocolValid(view);
+});
+
 test("旧转录里非法的 cutIndex(指向 tool 消息)被视图兜住", () => {
   // 旧版本 harness 写下的 compaction 行可能把切点指在 tool 上,
   // 加载后不能直接拿去发请求——buildContextView 要再兜一次

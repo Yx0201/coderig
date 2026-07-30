@@ -14,7 +14,8 @@ import { summarize } from "./compact.ts";
 // - logs/history/<cid>.jsonl 记"发给模型的对话转录本身"(一个对话一个文件),完整不截断。
 // 续话时原样把消息灌回内存当上下文,所以落盘的必须是我们真正发给模型的东西。
 
-const HISTORY_DIR = "logs/history";
+// 可用 HISTORY_DIR 覆盖:多项目复用同一份 harness、或把转录放到项目外时要换目录
+const HISTORY_DIR = process.env.HISTORY_DIR || "logs/history";
 
 // 对话元数据头:写在每个文件第一行,关联到 trace 的 sid 用
 export interface HistoryMeta {
@@ -146,7 +147,15 @@ export class History {
     return out;
   }
 
-  // 暴露只读视图:完整原始消息(事实层),search_history/诊断用
+  // 暴露只读视图:完整原始消息(事实层),search_history/诊断用。
+  //
+  // 有意不做的优化:压缩后 splice 掉 cutIndex 之前的消息来省内存。
+  // 三个理由,任一都足以否决:
+  // 1) cutIndex 是指向本数组的绝对索引,splice 会让它和转录里已落盘的
+  //    compaction 行(同样记绝对索引)全部错位,续话直接读出错误的视图;
+  // 2) 事实层的意义就是"完整不可变",search_history 要能搜到被压掉的早期内容;
+  // 3) 量级不值得:1000 条 × 5KB 的极端长对话也才 ~5MB 常驻。
+  // 真要省内存的正确做法是"按需从 jsonl 流式读取",而不是破坏事实层
   get messages(): readonly ChatMessage[] {
     return this.msgs;
   }
@@ -189,14 +198,27 @@ export class History {
     this.appendLine({ kind: "msg", ...msg } as HistoryLine);
   }
 
-  // 内部:把一行 JSON 追加进文件。串行写盘保行序,落盘失败不抛(观测/转录层不能搞崩主流程)
+  // 落盘失败的上报口。由 chat.ts 注入(底层不直接依赖 tracer,遵守观测约定)。
+  // 为什么必须上报:静默吞掉会让"续话时少了几条消息"变成无法诊断的怪事——
+  // 磁盘满/权限错是真实故障,不能既不中断也不留痕
+  onWriteError?: (message: string) => void;
+  // 只报第一次:磁盘满时后续每条消息都会失败,逐条上报会把 trace 刷满
+  private writeErrorReported = false;
+
+  // 内部:把一行 JSON 追加进文件。串行写盘保行序,落盘失败不抛(转录层不能搞崩主流程),
+  // 但要通过 onWriteError 留痕
   private appendLine(line: HistoryLine): void {
     this.writeQueue = this.writeQueue.then(async () => {
       try {
         await mkdir(HISTORY_DIR, { recursive: true });
         await appendFile(this.path, JSON.stringify(line) + "\n", "utf8");
-      } catch {
-        // 落盘失败静默吞掉:宁可漏记也不能让对话流程因写盘出错而中断
+      } catch (err) {
+        if (!this.writeErrorReported) {
+          this.writeErrorReported = true;
+          this.onWriteError?.(
+            `history 落盘失败(后续同类错误不再重复报告),转录可能不完整: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
     });
   }

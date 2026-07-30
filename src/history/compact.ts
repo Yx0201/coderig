@@ -26,6 +26,30 @@ const TOOL_LINE_MAX = 300; // 工具结果:留个头就够,细节可重新调工
 const TEXT_LINE_MAX = 2000; // user/assistant 正文:任务意图,留足
 const ARGS_LINE_MAX = 200; // 工具参数:路径/pattern 够看,不带文件全文
 
+// token 估算:中文和英文的字符/token 比差一倍多(CJK 约 1 字符/token,
+// 拉丁文约 4 字符/token),一律按 3.5 算的话,纯中文转录会被严重低估——
+// 摘要请求可能刚好超窗口 400,而压缩本就是在"上下文已经太大"时触发的,
+// 这一发失败等于压缩机制在最需要它的时候失效。分开计权保守估:
+// CJK 按 1、其余按 4,宁可估多丢几行,也不要撑爆
+const CHARS_PER_TOKEN_LATIN = 4;
+export function estimateTokens(text: string): number {
+  let cjk = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!;
+    // CJK 统一表意文字 + 扩展A + 日文假名 + 韩文音节 + 全角标点
+    if (
+      (c >= 0x3040 && c <= 0x30ff) ||
+      (c >= 0x3400 && c <= 0x4dbf) ||
+      (c >= 0x4e00 && c <= 0x9fff) ||
+      (c >= 0xac00 && c <= 0xd7af) ||
+      (c >= 0xff00 && c <= 0xffef)
+    )
+      cjk++;
+  }
+  const latin = [...text].length - cjk;
+  return cjk + Math.ceil(latin / CHARS_PER_TOKEN_LATIN);
+}
+
 // 单条文本截断:保头保尾(长报错的关键信息常在末尾),掐中间
 function clip(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -63,20 +87,20 @@ export async function summarize(
   // 若把整个被压区原样喂进去,摘要这一发请求会比原请求还大,直接 400 撑爆——
   // 压缩反而成了压垮对话的那根稻草。opencode 同样在发摘要前校验
   // Token.estimate(summaryPrompt) > context - summaryOutput 就放弃。
-  // 这里用字符预算(约 3.5 字符/token)近似:留一半窗口给摘要输入,
-  // 剩下给指令、旧摘要和输出。超了就从最旧的行开始丢(旧的已被上一轮摘要覆盖过)
-  const budgetChars = Math.floor(CONTEXT_WINDOW_TOKENS * 0.5 * 3.5);
+  // 留一半窗口给摘要输入,剩下给指令、旧摘要和输出;
+  // 超了就从最旧的行开始丢(旧的已被上一轮摘要覆盖过)
+  const budgetTokens = Math.floor(CONTEXT_WINDOW_TOKENS * 0.5);
   const lines = cutMsgs.map(lineOf);
   let transcript = lines.join("\n");
-  if (transcript.length > budgetChars) {
+  if (estimateTokens(transcript) > budgetTokens) {
     const kept: string[] = [];
     let acc = 0;
     // 从最新往回收,保住离当前任务最近的历史
     for (let i = lines.length - 1; i >= 0; i--) {
-      const l = lines[i]!;
-      if (acc + l.length > budgetChars) break;
-      kept.unshift(l);
-      acc += l.length;
+      const cost = estimateTokens(lines[i]!);
+      if (acc + cost > budgetTokens) break;
+      kept.unshift(lines[i]!);
+      acc += cost;
     }
     const dropped = lines.length - kept.length;
     transcript =

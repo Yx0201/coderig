@@ -30,6 +30,9 @@ export async function startChat(resumeCid?: string) {
   const history = resumeCid
     ? await History.load(resumeCid)
     : History.create({ model, promptVersion: sys.version });
+  // 转录落盘失败要留痕:静默吞掉会让"续话时少了几条消息"变成无法诊断的怪事。
+  // store 不直接依赖 tracer(遵守观测约定),由这里注入上报口
+  history.onWriteError = (msg) => tracer.error(msg);
   tracer.startSession({
     promptVersion: sys.version,
     systemPromptChars: sys.content?.length ?? 0,
