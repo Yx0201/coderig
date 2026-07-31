@@ -22,15 +22,17 @@ coderig
 ## 用法
 
 ```
-coderig                  在当前目录开始新对话
-coderig --resume <cid>   续话指定对话
-coderig --list           列出历史对话
-coderig config           重新跑配置向导
-coderig --version        版本号
-coderig --help           显示帮助
+coderig                      在当前目录开始新对话
+coderig --resume <cid>       续话指定对话
+coderig --list               列出历史对话
+coderig --snapshots [cid]    列出改动快照(模型改坏文件后靠它找回原内容)
+coderig --restore <cid> <path>  恢复该文件的快照内容(覆盖前确认)
+coderig config               重新跑配置向导
+coderig --version            版本号
+coderig --help               显示帮助
 ```
 
-它能做的:读取/搜索/修改当前目录的代码、运行 shell 命令(危险命令会先问你)、记住跨会话的对话历史并检索。
+它能做的:读取/搜索/修改当前目录的代码、运行 shell 命令(危险命令会先问你)、记住跨会话的对话历史并检索、复杂任务先拆解规划(todo)、进入规划模式(enter_plan_mode)只读调研并提交计划审批后再实施、每次改动前自动留底快照(改错可 `--restore` 恢复)。
 
 ## 配置
 

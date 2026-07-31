@@ -3,10 +3,11 @@ import { renderLoading, renderError } from "./render.ts";
 import type { ChatMessage, ToolCall } from "../llm/types.ts";
 import { sendMessages } from "../llm/client.ts";
 import pc from "picocolors";
-import { get, listDefs } from "../tools/registry.ts";
-import { checkPermission } from "../tools/permissions.ts";
+import { get, listDefs, type ToolEntry } from "../tools/registry.ts";
+import { checkPermission, classifyBash } from "../tools/permissions.ts";
+import { planGuardViolation } from "../tools/plan_mode.ts";
 import { Tracer } from "../observability/tracer.ts";
-import { resolveSystemPrompt } from "../prompts/system.ts";
+import { resolveSystemPrompt, runtimeReminder } from "../prompts/system.ts";
 import { History } from "../history/store.ts";
 import {
   shouldCompact,
@@ -14,6 +15,13 @@ import {
   contextWindowTokens,
 } from "../history/context.ts";
 import { isDoomLoop, type CallSig } from "./doom_loop.ts";
+import { createSessionContext } from "../tools/context.ts";
+import { partitionToolCalls, buildWaves, FileLocks } from "../tools/partition.ts";
+import { SnapshotStore } from "../tools/snapshot.ts";
+import { snapshotDir, plansDir } from "../config/paths.ts";
+import { loadSettings, addPermission } from "../config/settings.ts";
+import { resolve, sep } from "node:path";
+import { gcStateDir } from "../tools/gc.ts";
 
 const tracer = new Tracer();
 
@@ -22,6 +30,8 @@ const tracer = new Tracer();
 export async function startChat(resumeCid?: string) {
   // 不再每次清空 trace:骨架阶段已过,进入 sysprompt A/B 阶段,
   // 日志跨运行累积,靠每条事件的 sid 切出单次运行做前后对比(见 CLAUDE.md 观测约定)
+  // 惰性 GC tmp/ 与 snapshots/(评审 P1-10):fire-and-forget,不阻塞启动
+  void gcStateDir();
   const sys = resolveSystemPrompt();
   const model = process.env.MODEL || "?";
 
@@ -47,10 +57,26 @@ export async function startChat(resumeCid?: string) {
   );
 
   const loading = renderLoading();
-  // 会话级权限放行名单:用户在确认提示里选"本会话不再询问 X"时加入。
+  // 配置级权限(settings.json):allow 种子进会话放行名单,deny 既硬禁止又从模型可见列表隐藏。
+  // 会话级放行名单:用户在确认提示里选"本会话不再询问 X"时加入。
   // 只记工具名粒度(bash/write_file/edit_file);危险命令与敏感路径不可放行,
   // 由 permissions.ts 的 rememberable=false 保证进不了这个集合
-  const sessionAllows = new Set<string>();
+  const settings = await loadSettings();
+  const sessionAllows = new Set<string>(settings.permissions.allow);
+  const denyTools = new Set<string>(settings.permissions.deny);
+  // 会话级工具状态(冲突检测/read-before-write/todo/快照),按对话 cid 分组快照——
+  // 续话时同一段对话共享快照,恢复时也按 cid 找
+  const snapshotStore = new SnapshotStore(snapshotDir(), history.cid);
+  const ctx = createSessionContext({
+    snapshot: (path) => snapshotStore.snapshot(path),
+    // 审批 UI 钩子:exit_plan_mode 提交计划时弹确认,用户批准才切回正常模式。
+    // 注意 p.confirm 返回 boolean|symbol:点"否"是 false(不是 cancel symbol),
+    // 直接 !isCancel() 会把"否"取反成"是"——必须同时检查 r === true(评审 P0-2)
+    confirm: async (msg) => {
+      const r = await p.confirm({ message: msg });
+      return !p.isCancel(r) && r === true;
+    },
+  });
 
   // 收尾轮:不带 tools 发最后一轮请求,模型只能输出文本。
   // 用于"达到轮数上限"和"检测到死循环且用户选择停止"两种异常收尾——
@@ -150,7 +176,12 @@ export async function startChat(resumeCid?: string) {
       try {
         for await (const event of sendMessages(
           history.contextMessages, // 发送视图:压缩/裁剪后的投影,而非完整转录(见 history/context.ts)
-          listDefs(),
+          listDefs(denyTools), // 配置级 deny 的工具不给模型(visibleTools;空集时 listDefs 内部已处理)
+          // 每轮注入运行时状态:模式(workflow 段)+ todo 清单(静态正文之外)
+          {
+            mode: ctx.state.mode,
+            runtime: runtimeReminder(ctx.state.mode, ctx.todos),
+          },
         )) {
           if (!started) {
             loading.stop();
@@ -352,11 +383,32 @@ export async function startChat(resumeCid?: string) {
         ...(reasoning ? { reasoning_content: reasoning } : {}),
       });
 
-      // 执行一个工具并记观测。tracer.toolCall/toolResult 都在这里面调——
-      // 紧贴真实开始/结束时刻,duration 才是该工具自己的耗时;
-      // 若挪到批末统一调,每个工具量到的都是"整批耗时",快工具被慢工具污染,
-      // 并行的收益在 trace 里反而看不见
-      const runTool = async (tc: ToolCall) => {
+      // 工具执行拆成两阶段(评审 P0-4):
+      //   阶段1 审批:wave 内逐个调用串行决策(权限/plan 守卫/确认框),确认框不并发抢 TTY;
+      //   阶段2 执行:已放行的调用并发跑 handler(仍按 path 加锁)。
+      // tracer.toolCall 在阶段1 记开始,toolResult 在阶段2(或被拒时)记结束,
+      // toolApproved 重锚定计时起点——审批耗时不算进工具耗时。
+
+      // 拒绝文案(含工具级修复指引,参考 opencode CorrectedError 的 feedback 思路)
+      const denialMessage = (
+        toolName: string,
+        reason: string,
+        hardDeny: boolean,
+      ): string => {
+        const hint =
+          hardDeny && toolName === "bash" && /rm\s|删除|删除命令/.test(reason)
+            ? " 提示:删除不可逆,不要找替代命令重试;确实要清理就请用户手动执行。"
+            : "";
+        return (
+          (hardDeny
+            ? `错误：该操作被安全策略硬禁止(${reason})。请改用其它思路,或告知用户需要手动处理`
+            : `错误：用户拒绝了本次操作。不要换种方式重试同一意图;请先在回复中说明你想做什么、征得用户同意后再继续`) +
+          hint
+        );
+      };
+
+      // 阶段1 审批:返回 allowed=false + result(被拒原因) 或 allowed=true + args + entry
+      const approveToolCall = async (tc: ToolCall) => {
         let args: any = {};
         try {
           args = JSON.parse(tc.function.arguments);
@@ -367,121 +419,158 @@ export async function startChat(resumeCid?: string) {
             `工具参数解析失败: ${tc.function.name} ← ${tc.function.arguments.slice(0, 200)}`,
           );
         }
-
-        tracer.toolCall(tc.function.name, args, tc.id); // 记工具调用开始(点事件),带 callId 供并行下配对
+        tracer.toolCall(tc.function.name, args, tc.id); // 记开始,带 callId 供配对
 
         const entry = get(tc.function.name);
-        let result: string;
-        let ok: boolean;
-        if (!entry) {
-          result = `错误：未知工具 ${tc.function.name}`;
-          ok = false;
-        } else {
-          // 权限门:handler 执行前分级。auto 直接放行;deny 硬禁不问;
-          // ask 弹确认(可记会话放行名单)。被拒绝/禁止也走正常 toolResult 回填——
-          // 协议要求每个 tool_call_id 必有回应,且"模型尝试了什么"必须在转录里留痕
-          const perm = checkPermission(tc.function.name, args, sessionAllows);
-          let allowed = perm.action === "auto";
-          if (perm.action === "deny") {
+        if (!entry) return { allowed: false, result: `错误：未知工具 ${tc.function.name}` };
+
+        // plan 模式写守卫(模式级约束高于工具权限)
+        if (ctx.state.mode === "plan") {
+          const violation = planGuardViolation(tc.function.name, args);
+          if (violation) return { allowed: false, result: violation };
+        }
+
+        // 权限门:auto 直接放行;deny 硬禁;ask 弹确认(串行,不并发抢 TTY)
+        const perm = checkPermission(tc.function.name, args, sessionAllows, denyTools);
+        if (perm.action === "deny") {
+          tracer.approval({
+            tool: tc.function.name,
+            action: "deny",
+            decision: "deny",
+            reason: perm.reason,
+          });
+          process.stdout.write(pc.red(`\n⛔ 已阻止: ${perm.reason}\n`));
+          return { allowed: false, result: denialMessage(tc.function.name, perm.reason, true) };
+        }
+        if (perm.action === "ask") {
+          const choice = await p.select({
+            message: `⚠ 模型请求: ${perm.reason}`,
+            options: [
+              { value: "allow" as const, label: "允许一次" },
+              ...(perm.rememberable
+                ? [
+                    { value: "session" as const, label: `本会话不再询问 ${tc.function.name}` },
+                    // "总是允许"只给文件写工具,不给 bash——一次点击 = 所有命令永久免问,
+                    // 授权范围远超用户预期(评审 P2-1)
+                    ...(tc.function.name === "bash"
+                      ? []
+                      : [{ value: "persist" as const, label: "总是允许(写入配置)" }]),
+                  ]
+                : []),
+              { value: "deny" as const, label: "拒绝" },
+            ],
+          });
+          if (p.isCancel(choice) || choice === "deny") {
             tracer.approval({
               tool: tc.function.name,
-              action: "deny",
+              action: "ask",
               decision: "deny",
               reason: perm.reason,
             });
-            process.stdout.write(pc.red(`\n⛔ 已阻止: ${perm.reason}\n`));
-          } else if (perm.action === "ask") {
-            // 注意:会走到这里的只有写工具(只读工具全部 auto),而写工具是串行执行的,
-            // 不存在多个确认框并发的问题(见下方 parallelizable/serial 的划分)
-            const choice = await p.select({
-              message: `⚠ 模型请求: ${perm.reason}`,
-              options: [
-                { value: "allow" as const, label: "允许一次" },
-                ...(perm.rememberable
-                  ? [
-                      {
-                        value: "session" as const,
-                        label: `本会话不再询问 ${tc.function.name}`,
-                      },
-                    ]
-                  : []),
-                { value: "deny" as const, label: "拒绝" },
-              ],
-            });
-            if (p.isCancel(choice) || choice === "deny") {
-              tracer.approval({
-                tool: tc.function.name,
-                action: "ask",
-                decision: "deny",
-                reason: perm.reason,
-              });
-            } else {
-              allowed = true;
-              if (choice === "session") sessionAllows.add(tc.function.name);
-              tracer.approval({
-                tool: tc.function.name,
-                action: "ask",
-                decision: choice === "session" ? "session_allow" : "allow",
-                reason: perm.reason,
-              });
-            }
+            return { allowed: false, result: denialMessage(tc.function.name, perm.reason, false) };
           }
-
-          if (!allowed) {
-            // 拒绝文案要点:明确告诉模型"不要换皮重试同一操作"——
-            // 否则模型常把 rm 换成 mv、把被拒的命令拆成多步绕道达成,
-            // 权限门就形同虚设。让用户先表态,模型再行动
-            result =
-              perm.action === "deny"
-                ? `错误：该操作被安全策略硬禁止(${perm.reason})。请改用其它思路,或告知用户需要手动处理`
-                : `错误：用户拒绝了本次操作。不要换种方式重试同一意图;请先在回复中说明你想做什么、征得用户同意后再继续`;
-            ok = false;
-          } else {
-            // 重新锚定计时起点:权限确认等用户的耗时不能算进工具耗时
-            // (实测 write_file 执行 4ms 被记成 11.8s,全是用户看确认框的时间)
-            tracer.toolApproved(tc.id);
-            // 慢工具提示:300ms 内跑完的不打扰(read_file 就几毫秒,提示反而是噪音);
-            // 超过才打一行"执行中"(bash tsc 要几秒,静默期会让用户以为卡死)
-            const slowTimer = setTimeout(() => {
-              process.stdout.write(pc.dim(`⏳ ${tc.function.name} 执行中…\n`));
-            }, 300);
-            try {
-              result = await entry.handler(args);
-              // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
-              ok = !result.startsWith("错误");
-            } catch (err) {
-              // handler 意外 throw(工具约定之外的异常)也归一化成"错误："回填,
-              // 保证协议要求的"每个 tool_call_id 必有回应",且失败统计不漏
-              result = `错误：工具执行异常 ${tc.function.name}: ${err instanceof Error ? err.message : String(err)}`;
-              ok = false;
-            } finally {
-              clearTimeout(slowTimer);
-            }
+          if (choice === "session") {
+            sessionAllows.add(tc.function.name);
+          } else if (choice === "persist") {
+            // 写入 settings.json 跨会话持久放行。危险命令/敏感路径由
+            // rememberable=false 保证不出现"总是允许"选项,到不了这里
+            sessionAllows.add(tc.function.name);
+            await addPermission("allow", tc.function.name);
           }
+          tracer.approval({
+            tool: tc.function.name,
+            action: "ask",
+            decision:
+              choice === "session"
+                ? "session_allow"
+                : choice === "persist"
+                  ? "persist_allow"
+                  : "allow",
+            reason: perm.reason,
+          });
         }
+        return { allowed: true, args, entry };
+      };
 
-        tracer.toolResult(tc.function.name, result, ok, tc.id); // 记工具返回(段事件,duration=本工具真实耗时)
+      // 阶段2 执行:审批已放行,重锚定计时起点后并发跑 handler
+      const executeToolCall = async (
+        tc: ToolCall,
+        args: any,
+        entry: ToolEntry,
+      ): Promise<string> => {
+        // 审批耗时(含用户看确认框的时间)不算进工具耗时
+        tracer.toolApproved(tc.id);
+        // 慢工具提示:300ms 内跑完的不打扰(read_file 就几毫秒,提示反而是噪音);
+        // 超过才打一行"执行中"(bash tsc 要几秒,静默期会让用户以为卡死)
+        const slowTimer = setTimeout(() => {
+          process.stdout.write(pc.dim(`⏳ ${tc.function.name} 执行中…\n`));
+        }, 300);
+        let result: string;
+        let ok: boolean;
+        try {
+          // 每调用一个 ctx 浅拷贝:fileStates/todos 等共享引用照常更新,
+          // gate 重绑当前工具名,落 trace 时能区分哪个工具触发的拦截
+          const runCtx = {
+            ...ctx,
+            gate: (
+              info: { kind: "read_before_write" | "conflict"; path: string },
+            ) => tracer.toolGate({ ...info, tool: tc.function.name }),
+          };
+          result = await entry.handler(args, runCtx);
+          // 全部工具约定失败时返回"错误："前缀,靠它判定 ok,否则 toolFailures 永远是 0
+          ok = !result.startsWith("错误");
+        } catch (err) {
+          // handler 意外 throw(工具约定之外的异常)也归一化成"错误："回填,
+          // 保证协议要求的"每个 tool_call_id 必有回应",且失败统计不漏
+          result = `错误：工具执行异常 ${tc.function.name}: ${err instanceof Error ? err.message : String(err)}`;
+          ok = false;
+        } finally {
+          clearTimeout(slowTimer);
+        }
+        tracer.toolResult(tc.function.name, result, ok, tc.id);
         return result;
       };
 
-      // 只读工具并行、写工具串行:并发省时,但 edit_file/write_file/bash 是
-      // read-modify-write,同一轮并行改同一个文件会互相覆盖(后写的赢,且两次都报成功)——
-      // 这是并行化引入的数据竞争,不是模型的问题,必须在 harness 层挡住。
-      // 写工具按模型给出的原始顺序依次跑,语义与串行版本完全一致
+      // 只读并行、写按调用内容细判(见 partition.ts):bash 只读命令可并行;
+      // write/edit 按目标文件加锁(同文件互斥、异文件可并行);bash 非只读全局串行。
+      // buildWaves 把"可并发批"组织好,批间顺序 = 模型给出的顺序,语义与串行版本一致。
+      // 这是并行化引入的数据竞争,不是模型的问题,必须在 harness 层挡住
       const results = new Array<string>(toolCallsToRun.length);
-      const parallelizable: number[] = [];
-      const serial: number[] = [];
-      toolCallsToRun.forEach((tc, i) => {
-        (get(tc.function.name)?.mutates ? serial : parallelizable).push(i);
-      });
-
-      await Promise.all(
-        parallelizable.map(async (i) => {
-          results[i] = await runTool(toolCallsToRun![i]!);
-        }),
-      );
-      for (const i of serial) {
-        results[i] = await runTool(toolCallsToRun[i]!);
+      const fileLocks = new FileLocks();
+      const waves = buildWaves(partitionToolCalls(toolCallsToRun, get));
+      for (const wave of waves) {
+        // 阶段1:串行审批(确认框逐个弹,不并发抢 TTY——评审 P0-4)
+        const approvals: {
+          allowed: boolean;
+          result?: string;
+          args?: any;
+          entry?: ToolEntry;
+        }[] = [];
+        for (const { toolCall } of wave) {
+          const a = await approveToolCall(toolCall);
+          if (!a.allowed) {
+            tracer.toolResult(toolCall.function.name, a.result!, false, toolCall.id);
+          }
+          approvals.push(a);
+        }
+        // 阶段2:并发执行已放行的调用(仍按 path 加锁)
+        await Promise.all(
+          wave.map(async ({ index, toolCall, kind, lockPath }, i) => {
+            const a = approvals[i]!;
+            if (!a.allowed) {
+              results[index] = a.result!;
+              return;
+            }
+            const exec = () =>
+              executeToolCall(toolCall, a.args!, a.entry!).then((r) => {
+                results[index] = r;
+              });
+            // 写工具按绝对路径加锁:"src/a.ts" 与 "./src/a.ts" 才能互斥
+            return kind === "file_lock" && lockPath
+              ? fileLocks.withLock(resolve(lockPath), exec)
+              : exec();
+          }),
+        );
       }
 
       // 回填按 tool_calls 原始顺序,与完成顺序无关——
