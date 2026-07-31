@@ -17,7 +17,7 @@ cd your-project
 coderig
 ```
 
-首次运行会引导你配置 provider(DeepSeek / OpenAI / 任意 OpenAI 兼容端点)和 API key,写入 `~/.coderig/config.json`。
+首次运行会引导你填入 DeepSeek API key(模型固定 `deepseek-v4-flash`,后端只支持 DeepSeek),写入 `~/.coderig/config.json`。
 
 ## 用法
 
