@@ -21,9 +21,13 @@ export function register(tool: ToolEntry) {
   });
 }
 
-// 拿所有工具描述 → 给 sendMessages 的 tools 参数
-export function listDefs(): ToolDef[] {
-  return [...tools.values()].map((t) => t.def);
+// 拿所有工具描述 → 给 sendMessages 的 tools 参数。
+// hidden:从模型可见列表里剔除的工具名(配置级 deny 的工具直接不给模型,
+// 省得它费 token 调一个必被拒的工具 —— 参考 opencode 的 visibleTools)
+export function listDefs(hidden?: ReadonlySet<string>): ToolDef[] {
+  return [...tools.values()]
+    .filter((t) => !hidden?.has(t.def.function.name))
+    .map((t) => t.def);
 }
 
 // 按 name 拿 handler → loop 执行时用

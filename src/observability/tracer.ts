@@ -19,6 +19,7 @@ export interface TraceEvent {
     | "nudge" // 空回答兜底:模型本轮无 content/tool_calls,harness 注入续轮提示
     | "compaction" // 上下文压缩:prompt_tokens 达阈值,旧历史被摘要替代(点事件,带切点/摘要长度)
     | "approval" // 权限门:一次人工确认(允许/会话放行/拒绝),A/B 时看模型尝试危险操作的频率
+    | "tool_gate" // 工具护栏:read-before-write/冲突检测拦截(harness 兜底,不带模型主观判断)
     | "doom_loop" // 死循环检测:连续 N 次相同工具调用,带工具名/参数/用户决定
     | "retry" // LLM 请求重试:云端 API 抖动(429/5xx/网络错误),带次数/退避时长/原因
     | "error"; // 错误
@@ -221,7 +222,9 @@ export class Tracer {
   approval(info: {
     tool: string;
     action: "ask" | "deny"; // ask=问了用户,deny=安全策略硬禁
-    decision: "allow" | "session_allow" | "deny"; // 用户/策略的最终决定
+    // 用户/策略的最终决定:allow=允许一次, session_allow=会话放行,
+    // persist_allow=写入 settings.json 持久放行, deny=拒绝
+    decision: "allow" | "session_allow" | "persist_allow" | "deny";
     reason: string;
   }) {
     this.push("approval", info);
@@ -242,6 +245,13 @@ export class Tracer {
   // 记工具名、参数(截断)和用户的决定——A/B 时能看出哪版提示词更容易让模型卡死
   doomLoop(info: { tool: string; args: string; decision: "continue" | "stop" }) {
     this.push("doom_loop", info);
+  }
+
+  // 工具护栏拦截:read-before-write 或冲突检测拦下了这次写操作。
+  // 这是 harness 兜底层面的观测——记录"模型多少次尝试在未读/读后过时的情况下写文件",
+  // 不中断对话(工具结果里已带错误回填给模型自纠)
+  toolGate(info: { kind: "read_before_write" | "conflict"; tool: string; path: string }) {
+    this.push("tool_gate", info);
   }
 
   // 错误:记 error 事件

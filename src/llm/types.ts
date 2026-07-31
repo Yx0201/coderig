@@ -76,4 +76,9 @@ export interface ToolDef {
   };
 }
 
-export type ToolHandler = (args: any) => string | Promise<string>;
+// 第二个参数 ctx 是会话级状态(冲突检测/todo/快照用,见 src/tools/context.ts)。
+// 不改工具状态的 handler 可以不引用它,但签名统一带,保证所有工具可读会话上下文
+export type ToolHandler = (
+  args: any,
+  ctx: import("../tools/context.ts").ToolContext,
+) => string | Promise<string>;
