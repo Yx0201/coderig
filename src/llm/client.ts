@@ -2,6 +2,7 @@ import type { ChatMessage, StreamEvent, ToolDef,ToolCall } from "./types.ts";
 import { parseSSE } from "./stream.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
 import { getConfig } from "../config/index.ts";
+import type { AgentMode } from "../tools/context.ts";
 
 // 指数退避 + 抖动:1s/2s/4s…封顶 15s。抖动防多客户端同时重试再撞一次(thundering herd)
 function backoffMs(attempt: number): number {
@@ -13,15 +14,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // opts.noSystemPrompt:不注入编码助手 sysprompt。
 // 给"辅助性 LLM 调用"用(如 history 摘要):那类调用不是在扮演编码助手,
 // 注入"改代码必须先 read_file / 必须跑 tsc"这类工具纪律只会污染任务
+// opts.mode / opts.runtime:plan 模式与每轮运行时状态(见 prompts/system.ts),
+// 由 chat.ts 从会话上下文传入
 export async function* sendMessages(
   messages: readonly ChatMessage[],
   tools?: ToolDef[],
-  opts?: { noSystemPrompt?: boolean },
+  opts?: { noSystemPrompt?: boolean; mode?: AgentMode; runtime?: string },
 ): AsyncGenerator<StreamEvent> {
   // PROMPT_VERSION=none 时 content 为 null → 不注入,跑无系统提示词的基线
   const sys = opts?.noSystemPrompt
     ? { version: "none", content: null }
-    : resolveSystemPrompt();
+    : resolveSystemPrompt(opts?.mode);
 
   // 配置在函数内取,不在模块顶层——模块顶层是 import 时,
   // 而配置要等入口跑完 loadConfig/setConfig 才就绪(见 config/index.ts)
@@ -35,9 +38,14 @@ export async function* sendMessages(
 
   const body = JSON.stringify({
     model: cfg.model,
-    messages: sys.content
-      ? [{ role: "system", content: sys.content }, ...messages]
-      : messages,
+    messages: [
+      ...(sys.content ? [{ role: "system", content: sys.content }] : []),
+      ...messages,
+      // 运行时状态作为消息尾部注入(评审 P2-2):system 是请求最前缀,
+      // 拼进 sys 会让 DeepSeek 上下文缓存从首个 token 起 miss;
+      // 放尾部不污染前缀,缓存照常命中
+      ...(opts?.runtime ? [{ role: "user", content: opts.runtime }] : []),
+    ],
     tools,
     max_tokens: maxTokens,
     stream: true,
