@@ -28,6 +28,8 @@ for (const { os, arch, abi, name } of TARGETS) {
     version: VERSION,
     description: `coderig platform binary for ${os}-${arch}${abi ? `-${abi}` : ""}`,
     license: "MIT",
+    // files 白名单:平台包只发 bin/ + package.json,不靠 .npmignore 兜底
+    files: ["bin"],
     os: [os === "windows" ? "win32" : os],
     cpu: [arch],
   };

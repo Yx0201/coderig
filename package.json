@@ -1,6 +1,6 @@
 {
   "name": "coderig",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "终端编码助手 — 学习用 mini agent harness",
   "license": "MIT",
   "repository": {
@@ -11,6 +11,11 @@
   "bin": {
     "coderig": "./bin/coderig"
   },
+  "files": [
+    "bin",
+    "postinstall.mjs",
+    "README.md"
+  ],
   "scripts": {
     "build": "bun run script/build.ts",
     "postinstall": "node ./postinstall.mjs"
@@ -26,12 +31,7 @@
     "coderig-windows-x64": "0.1.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
+    "@types/bun": "latest",
     "@clack/prompts": "^1.7.0",
     "cli-spinners": "^3.4.0",
     "picocolors": "^1.1.1"

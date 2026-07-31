@@ -1,0 +1,6 @@
+#!/bin/sh
+# ===== 占位文件:真二进制由 postinstall 链接进来 =====
+# 壳包的 bin/coderig 在 npm 安装时只是占位(postinstall.mjs 从平台包复制真二进制覆盖它)。
+# 若执行到这里说明 postinstall 没跑或失败了——直接报错引导重装,而不是给用户一个莫名失败。
+echo "coderig: 二进制未就位,postinstall 似乎未正常执行。请重新运行: npm install -g coderig" >&2
+exit 1
