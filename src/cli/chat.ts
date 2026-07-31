@@ -11,7 +11,7 @@ import { History } from "../history/store.ts";
 import {
   shouldCompact,
   hasOversizedMsg,
-  CONTEXT_WINDOW_TOKENS,
+  contextWindowTokens,
 } from "../history/context.ts";
 
 const tracer = new Tracer();
@@ -212,7 +212,7 @@ export async function startChat(resumeCid?: string) {
             // 明确记下来——这是该调大 CONTEXT_WINDOW_TOKENS 或换大窗口模型的信号,
             // 而不是静默硬发到 API 报 400
             tracer.error(
-              `上下文超阈值但无可压缩空间(prompt_tokens=${currentUsage.prompt_tokens},预算=${CONTEXT_WINDOW_TOKENS}),建议调大 CONTEXT_WINDOW_TOKENS 或换大窗口模型`,
+              `上下文超阈值但无可压缩空间(prompt_tokens=${currentUsage.prompt_tokens},预算=${contextWindowTokens()}),建议调大 CONTEXT_WINDOW_TOKENS 或换大窗口模型`,
             );
           }
         } catch (err) {

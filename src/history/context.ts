@@ -1,4 +1,5 @@
 import type { ChatMessage } from "../llm/types.ts";
+import { getConfig } from "../config/index.ts";
 
 // ===== 上下文管理(纯逻辑,不碰 LLM/磁盘) =====
 //
@@ -7,10 +8,11 @@ import type { ChatMessage } from "../llm/types.ts";
 // 视图 = [摘要消息(若压缩过)] + 尾部原文(旧的大工具结果/超长工具参数被裁剪成占位符)。
 
 // 模型上下文窗口预算(token)。DeepSeek 官方窗口 1M token;
-// 压缩触发阈值见 COMPACT_THRESHOLD(80% 即 800k 触发,余量留给输出)
-export const CONTEXT_WINDOW_TOKENS = Number(
-  process.env.CONTEXT_WINDOW_TOKENS || 1_000_000,
-);
+// 压缩触发阈值见 COMPACT_THRESHOLD(80% 即 800k 触发,余量留给输出)。
+// 改成函数:模块顶层读不到配置(见 config/index.ts 的设计说明)
+export function contextWindowTokens(): number {
+  return getConfig().contextWindowTokens;
+}
 // 压缩触发阈值:不贴着窗口上限,80% 就触发——1M 窗口下留出 200k token 输出余量
 // (覆盖 MAX_OUTPUT_TOKENS 缺省 32768 数倍),同时避开超长上下文的注意力稀释区
 export const COMPACT_THRESHOLD = 0.8;
@@ -86,7 +88,7 @@ function capContent(text: string): string {
 
 // 触发判断:用上一轮 API 返回的真实 prompt_tokens,不做本地估算(分词器不一致,估不准)
 export function shouldCompact(promptTokens: number): boolean {
-  return promptTokens > CONTEXT_WINDOW_TOKENS * COMPACT_THRESHOLD;
+  return promptTokens > contextWindowTokens() * COMPACT_THRESHOLD;
 }
 
 // 视图里是否还有可回收的空间(超上限的单条消息)。

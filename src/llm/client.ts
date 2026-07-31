@@ -1,25 +1,7 @@
 import type { ChatMessage, StreamEvent, ToolDef,ToolCall } from "./types.ts";
 import { parseSSE } from "./stream.ts";
 import { resolveSystemPrompt } from "../prompts/system.ts";
-
-const url = process.env.BASE_URL || "";
-const endpoint = process.env.ENDPOINT || "";
-const ak = process.env.API_KEY || "";
-const model = process.env.MODEL || "";
-// 单次回答的输出上限(max_tokens)。DeepSeek 官方上限 384K,但不直接顶格:
-// 压缩阈值是窗口的 80%(1M → 800k),顶格 384K 会让 prompt+max_tokens 越过 1M 窗口;
-// 32768 保持"prompt ≤ 80% 窗口 ⇒ prompt + max_tokens ≤ 窗口"的不变量,
-// 对正常回答也绰绰有余。计费按实际生成量,不按声明值
-const maxTokens = Number(process.env.MAX_OUTPUT_TOKENS || 32768);
-
-// ---- 网络韧性(切云端后新出现的失败面,本地 ollama 时代不存在) ----
-// 最大重试次数(不含首发)。只重试"对方抖了"类错误:429/5xx/网络异常;
-// 4xx(400 参数错、401 鉴权错)重试无意义,直接抛
-const MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES || 3);
-const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
-// 请求超时:只管"发出请求到收到响应头"这段时间(TTFB)。
-// 流式 body 的传输不受它限制——长回答流几分钟是正常的,用总时长做超时会误杀长流
-const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60_000);
+import { getConfig } from "../config/index.ts";
 
 // 指数退避 + 抖动:1s/2s/4s…封顶 15s。抖动防多客户端同时重试再撞一次(thundering herd)
 function backoffMs(attempt: number): number {
@@ -40,8 +22,19 @@ export async function* sendMessages(
   const sys = opts?.noSystemPrompt
     ? { version: "none", content: null }
     : resolveSystemPrompt();
+
+  // 配置在函数内取,不在模块顶层——模块顶层是 import 时,
+  // 而配置要等入口跑完 loadConfig/setConfig 才就绪(见 config/index.ts)
+  const cfg = getConfig();
+  const maxTokens = cfg.maxOutputTokens;
+  const MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES || 3);
+  const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60_000);
+  // 网络韧性:只重试"对方抖了"类错误(429/5xx/网络异常);
+  // 4xx(400 参数错、401 鉴权错)重试无意义,直接抛
+  const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
   const body = JSON.stringify({
-    model,
+    model: cfg.model,
     messages: sys.content
       ? [{ role: "system", content: sys.content }, ...messages]
       : messages,
@@ -60,11 +53,11 @@ export async function* sendMessages(
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let failure: string | null = null; // 本轮失败原因(网络异常或 HTTP 状态),null=成功
     try {
-      response = await fetch(`${url}${endpoint}`, {
+      response = await fetch(`${cfg.baseUrl}${cfg.endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${ak}`,
+          Authorization: `Bearer ${cfg.apiKey}`,
         },
         body,
         signal: controller.signal,

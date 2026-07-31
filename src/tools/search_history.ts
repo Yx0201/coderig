@@ -1,16 +1,14 @@
-import { readdir, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 import type { HistoryLine } from "../history/store.ts";
+import { historyDir } from "../config/paths.ts";
 
 // ===== search_history:让 agent 检索自己的历史对话转录 =====
 //
-// 转录(logs/history/*.jsonl)是无损事实层,全文远超上下文窗口,
+// 转录(见 paths.ts 的 HISTORY_DIR)是无损事实层,全文远超上下文窗口,
 // 所以给模型的不是"读全文"而是"关键词检索"——命中片段带 cid,
 // 模型可据此追问更多细节(检索式长期记忆,而非全量注入)。
 
-const HISTORY_DIR = "logs/history";
 // 结果上限:检索工具自己不能成为撑爆 context 的源头
 const MAX_MATCHES = 15;
 const SNIPPET_LEN = 160;
@@ -69,12 +67,21 @@ export const searchHistoryHandler: ToolHandler = async (args) => {
     return `错误：无效的正则 ${e instanceof Error ? e.message : String(e)}`;
   }
 
-  if (!existsSync(HISTORY_DIR)) return "没有任何历史对话记录";
+  // Bun.file(dir).exists() 对目录返回 false,不能用它判断目录存在;
+  // 用 Bun.Glob.scan 探测,目录不存在会抛 ENOENT
+  let historyDirExists = false;
+  try {
+    await Array.fromAsync(new Bun.Glob("*").scan({ cwd: historyDir(), onlyFiles: true }));
+    historyDirExists = true;
+  } catch {
+    historyDirExists = false;
+  }
+  if (!historyDirExists) return "没有任何历史对话记录";
 
   try {
-    let files = (await readdir(HISTORY_DIR)).filter((f) =>
-      f.endsWith(".jsonl"),
-    );
+    let files = (
+      await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: historyDir() }))
+    ).filter((f) => f.endsWith(".jsonl"));
     if (onlyCid) {
       files = files.filter((f) => f === `${onlyCid}.jsonl`);
       if (files.length === 0) return `错误：会话不存在 ${onlyCid}`;
@@ -89,7 +96,7 @@ export const searchHistoryHandler: ToolHandler = async (args) => {
       const cid = f.replace(/\.jsonl$/, "");
       let raw: string;
       try {
-        raw = await readFile(join(HISTORY_DIR, f), "utf8");
+        raw = await Bun.file(join(historyDir(), f)).text();
       } catch {
         continue; // 单文件读失败跳过,不让整个搜索崩
       }

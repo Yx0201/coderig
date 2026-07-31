@@ -1,4 +1,3 @@
-import { readFile, writeFile } from "node:fs/promises";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
 // 改动区回显的上下文行数:前后各几行,让模型看到改动落点的邻居,行号即下一轮编辑的锚点
@@ -59,7 +58,7 @@ export const editFileHandler: ToolHandler = async (args) => {
   if (newString === null) return "错误：缺少 newString 参数";
 
   try {
-    const content = await readFile(path, "utf8");
+    const content = await Bun.file(path).text();
     const trailingNl = content.endsWith("\n");
 
     let next: string;
@@ -106,7 +105,7 @@ export const editFileHandler: ToolHandler = async (args) => {
       return "错误：需提供 oldString(模式1)或 start_line+end_line(模式2),二选一";
     }
 
-    await writeFile(path, next, "utf8");
+    await Bun.write(path, next);
 
     // 回显改动区(带行号):给模型"操作后的新鲜锚点",下一轮编辑可直接用行号定位,不靠记忆
     const newLines = next.split("\n");

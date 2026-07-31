@@ -1,4 +1,3 @@
-import { readdir, readFile } from "node:fs/promises";
 import { relative, isAbsolute } from "node:path";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
@@ -55,24 +54,21 @@ export const grepHandler: ToolHandler = async (args) => {
     // 收集要搜的文件列表（单文件则只搜它；目录则递归）
     let files: string[] = [];
     let isFileMode = false;
-    try {
-      const stat = await import("node:fs/promises").then((m) => m.stat(root));
-      if (stat.isFile()) {
-        files = [root];
-        isFileMode = true;
-      }
-    } catch {
-      // 不是已存在文件，按目录处理
+    // 判断 root 是文件还是目录:Bun.file().exists() 对目录返回 false,
+    // 所以 exists=true 一定是文件;exists=false 再试目录
+    const file = Bun.file(root);
+    if (await file.exists()) {
+      files = [root];
+      isFileMode = true;
     }
 
     if (!isFileMode) {
-      const entries = await readdir(root, {
-        withFileTypes: true,
-        recursive: true,
-      });
+      // 递归扫所有文件,Bun.Glob 的 ** 匹配任意层级
+      const entries = await Array.fromAsync(
+        new Bun.Glob("**/*").scan({ cwd: root, onlyFiles: true }),
+      );
       files = entries
-        .filter((e) => !e.isDirectory())
-        .map((e) => `${e.parentPath}/${e.name}`)
+        .map((e) => `${root}/${e}`)
         .filter((f) => !f.includes("node_modules") && !f.includes("/.git/"));
     }
 
@@ -84,7 +80,7 @@ export const grepHandler: ToolHandler = async (args) => {
         break;
       }
       try {
-        const content = await readFile(f, "utf8");
+        const content = await Bun.file(f).text();
         const lines = content.split("\n");
         const matched: { n: number; line: string }[] = [];
         for (let i = 0; i < lines.length; i++) {

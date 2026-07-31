@@ -1,8 +1,4 @@
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
-
-const execAsync = promisify(exec);
 
 // 输出上限:trace 分析里见过一次工具结果把上下文从 2k 撑到 10k tokens,
 // bash 的输出(如 cat 大文件、find /)更容易爆炸,必须截断
@@ -59,22 +55,40 @@ export const bashHandler: ToolHandler = async (args) => {
     MAX_TIMEOUT_MS,
   );
 
+  // Bun.spawn 的 sh -c 等价于 node:child_process exec,但原生 promise、
+  // 不需要 promisify,且 proc.kill() 能可靠地掐死超时命令
+  const proc = Bun.spawn(["sh", "-c", command], {
+    cwd: process.cwd(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const timer = setTimeout(() => {
+    proc.kill();
+  }, timeout);
+
   try {
-    const { stdout, stderr } = await execAsync(command, {
-      cwd: process.cwd(),
-      timeout,
-      maxBuffer: 5 * 1024 * 1024, // exec 的硬上限,超过直接报错;截断展示交给 truncate
-    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timer);
+
     const out = [stdout, stderr && `[stderr]\n${stderr}`]
       .filter(Boolean)
       .join("\n");
-    return truncate(out.trim() || "(命令成功,无输出)");
+
+    if (exitCode === 0) {
+      return truncate(out.trim() || "(命令成功,无输出)");
+    }
+    return `错误：命令失败,退出码 ${exitCode}\n${truncate(out.trim())}`;
   } catch (e: any) {
-    // exec 失败时 error 对象上仍挂着已产生的 stdout/stderr,回传给模型帮它定位原因
-    const detail = [e?.stdout, e?.stderr].filter(Boolean).join("\n").trim();
-    if (e?.killed)
-      return `错误：命令超时(${timeout}ms)被终止\n${truncate(detail)}`;
-    return `错误：命令失败,退出码 ${e?.code ?? "?"}\n${truncate(detail || String(e?.message ?? e))}`;
+    clearTimeout(timer);
+    proc.kill(); // 兜底,防止异常路径留下孤儿进程
+    if (e?.name === "AbortError" || e?.message?.includes("timeout"))
+      return `错误：命令超时(${timeout}ms)被终止`;
+    return `错误：命令执行异常 ${e instanceof Error ? e.message : String(e)}`;
   }
 };
 

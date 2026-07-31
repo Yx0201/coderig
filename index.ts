@@ -1,29 +1,87 @@
 import { startChat } from "./src/cli/chat.ts";
 import { setupTools } from "./src/tools/index.ts";
 import { History } from "./src/history/store.ts";
+import { loadConfig, setConfig } from "./src/config/index.ts";
+import { runSetup } from "./src/cli/setup.ts";
 
-// v1 的 CLI 入口:只给三个用法,不引入命令解析库
-//   bun index.ts                → 新开一段对话
-//   bun index.ts --list         → 列出所有历史对话
-//   bun index.ts --resume <cid> → 续话指定对话
+// coderig:终端编码助手
+//
+// 用法:
+//   coderig                  在当前目录开始新对话
+//   coderig --resume <cid>   续话指定对话
+//   coderig --list           列出历史对话
+//   coderig config           重新跑配置向导
+//   coderig --version        版本号
+//   coderig --help           显示帮助
+
+const VERSION = "0.1.0";
+
 const [, , ...args] = process.argv;
 
-if (args[0] === "--list") {
-  const list = await History.list();
-  if (list.length === 0) {
-    console.log("(暂无历史对话)");
-  } else {
-    // 简单表格输出:cid / 预览 / 消息数 / 模型 / 提示词版本
-    for (const h of list) {
-      const when = new Date(h.createdAt).toISOString().slice(0, 19).replace("T", " ");
-      console.log(
-        `${h.cid}  [${h.promptVersion}/${h.model}]  ${h.count}条  ${when}\n  → ${h.preview}`,
-      );
-    }
+function showHelp() {
+  console.log(`coderig v${VERSION} — 终端编码助手
+
+用法:
+  coderig                  在当前目录开始新对话
+  coderig --resume <cid>   续话指定对话
+  coderig --list           列出历史对话
+  coderig config           重新跑配置向导
+  coderig --version        版本号
+  coderig --help           显示帮助
+
+配置: 首次运行自动引导,或手动编辑 ~/.coderig/config.json
+`);
+}
+
+async function main() {
+  // 帮助和版本不需要配置
+  if (args.includes("--help") || args.includes("-h")) {
+    showHelp();
+    return;
   }
-} else {
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log(VERSION);
+    return;
+  }
+
+  // 配置向导(显式触发,或首次运行自动触发)
+  if (args[0] === "config") {
+    const cfg = await runSetup();
+    setConfig(cfg);
+    console.log("配置完成,现在可以运行 coderig 开始对话");
+    return;
+  }
+
+  // 列出历史对话不需要 LLM 配置
+  if (args[0] === "--list") {
+    const list = await History.list();
+    if (list.length === 0) {
+      console.log("(暂无历史对话)");
+    } else {
+      for (const h of list) {
+        const when = new Date(h.createdAt)
+          .toISOString()
+          .slice(0, 19)
+          .replace("T", " ");
+        console.log(
+          `${h.cid}  [${h.promptVersion}/${h.model}]  ${h.count}条  ${when}\n  → ${h.preview}`,
+        );
+      }
+    }
+    return;
+  }
+
+  // 主流程:加载配置 → 注入 → 启动对话
+  let cfg = await loadConfig();
+  if (!cfg) {
+    // 首次运行或配置不完整,跑向导
+    cfg = await runSetup();
+  }
+  setConfig(cfg);
+
   const resumeIdx = args.indexOf("--resume");
   const resumeCid = resumeIdx >= 0 ? args[resumeIdx + 1] : undefined;
+
   setupTools();
   try {
     await startChat(resumeCid);
@@ -33,3 +91,5 @@ if (args[0] === "--list") {
     process.exit(1);
   }
 }
+
+main();

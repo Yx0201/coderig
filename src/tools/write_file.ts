@@ -1,5 +1,3 @@
-import { writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
 export const writeFileDef: ToolDef = {
@@ -34,9 +32,9 @@ export const writeFileHandler: ToolHandler = async (args) => {
     return "错误：缺少 content 参数";
 
   try {
-    // 若父目录不存在则自动创建，方便在新建嵌套路径文件时一步到位
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, content, "utf8");
+    // Bun.write 自动创建缺失的父目录(与 mkdir recursive + writeFile 两步等价),
+    // 新建嵌套路径文件一步到位
+    await Bun.write(path, content);
     return `已写入 ${path} (${content.length} 字符)`;
   } catch (e) {
     return `错误：写入文件失败 ${e instanceof Error ? e.message : String(e)}`;

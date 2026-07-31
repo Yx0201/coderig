@@ -1,6 +1,6 @@
 import type { ChatMessage } from "../llm/types.ts";
 import { sendMessages } from "../llm/client.ts";
-import { CONTEXT_WINDOW_TOKENS } from "./context.ts";
+import { contextWindowTokens } from "./context.ts";
 
 // ===== 摘要压缩(调 LLM 的部分,与 context.ts 的纯逻辑分开) =====
 //
@@ -89,7 +89,7 @@ export async function summarize(
   // Token.estimate(summaryPrompt) > context - summaryOutput 就放弃。
   // 留一半窗口给摘要输入,剩下给指令、旧摘要和输出;
   // 超了就从最旧的行开始丢(旧的已被上一轮摘要覆盖过)
-  const budgetTokens = Math.floor(CONTEXT_WINDOW_TOKENS * 0.5);
+  const budgetTokens = Math.floor(contextWindowTokens() * 0.5);
   const lines = cutMsgs.map(lineOf);
   let transcript = lines.join("\n");
   if (estimateTokens(transcript) > budgetTokens) {

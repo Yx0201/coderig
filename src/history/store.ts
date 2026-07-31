@@ -1,5 +1,4 @@
-import { appendFile, mkdir, readdir, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { appendFile, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChatMessage } from "../llm/types.ts";
 import {
@@ -8,14 +7,13 @@ import {
   type CompactionState,
 } from "./context.ts";
 import { summarize } from "./compact.ts";
+import { historyDir } from "../config/paths.ts";
 
 // history 与 tracer 是两套独立持久化:
 // - trace.jsonl 记"观测事件"(按 sid 切一次运行),诊断用、会截断;
-// - logs/history/<cid>.jsonl 记"发给模型的对话转录本身"(一个对话一个文件),完整不截断。
+// - history/<cid>.jsonl 记"发给模型的对话转录本身"(一个对话一个文件),完整不截断。
 // 续话时原样把消息灌回内存当上下文,所以落盘的必须是我们真正发给模型的东西。
-
-// 可用 HISTORY_DIR 覆盖:多项目复用同一份 harness、或把转录放到项目外时要换目录
-const HISTORY_DIR = process.env.HISTORY_DIR || "logs/history";
+// 路径见 config/paths.ts:全局 ~/.coderig/history,不污染用户项目目录。
 
 // 对话元数据头:写在每个文件第一行,关联到 trace 的 sid 用
 export interface HistoryMeta {
@@ -56,7 +54,7 @@ export class History {
 
   private constructor(cid: string) {
     this.cid = cid;
-    this.path = join(HISTORY_DIR, `${cid}.jsonl`);
+    this.path = join(historyDir(), `${cid}.jsonl`);
   }
 
   // 新开对话:生成 cid(ISO 时间戳,与 tracer 的 sid 同格式,人眼可比对),写 meta 头
@@ -71,10 +69,11 @@ export class History {
   // 文件不存在直接抛——续话传错 cid 应该明确失败,而不是静默开新对话
   static async load(cid: string): Promise<History> {
     const h = new History(cid);
-    if (!existsSync(h.path)) {
+    const file = Bun.file(h.path);
+    if (!(await file.exists())) {
       throw new Error(`对话不存在: ${cid}`);
     }
-    const raw = await readFile(h.path, "utf8");
+    const raw = await file.text();
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let obj: HistoryLine;
@@ -106,10 +105,14 @@ export class History {
     model: string;
     promptVersion: string;
   }[]> {
-    if (!existsSync(HISTORY_DIR)) return [];
-    const files = (await readdir(HISTORY_DIR)).filter((f) =>
-      f.endsWith(".jsonl"),
-    );
+    // Bun.file(dir).exists() 对目录返回 false,不能用它判断目录;
+    // readdir 目录不存在会抛 ENOENT,用 try/catch 代替 existsSync
+    let files: string[];
+    try {
+      files = (await readdir(historyDir())).filter((f) => f.endsWith(".jsonl"));
+    } catch {
+      return []; // 目录不存在 = 没有历史对话
+    }
     const out: any[] = [];
     for (const f of files) {
       const cid = f.replace(/\.jsonl$/, "");
@@ -117,7 +120,7 @@ export class History {
       let firstUser = "";
       let count = 0;
       try {
-        const raw = await readFile(join(HISTORY_DIR, f), "utf8");
+        const raw = await Bun.file(join(historyDir(), f)).text();
         for (const line of raw.split("\n")) {
           if (!line.trim()) continue;
           const obj = JSON.parse(line) as HistoryLine;
@@ -210,7 +213,7 @@ export class History {
   private appendLine(line: HistoryLine): void {
     this.writeQueue = this.writeQueue.then(async () => {
       try {
-        await mkdir(HISTORY_DIR, { recursive: true });
+        await mkdir(historyDir(), { recursive: true });
         await appendFile(this.path, JSON.stringify(line) + "\n", "utf8");
       } catch (err) {
         if (!this.writeErrorReported) {

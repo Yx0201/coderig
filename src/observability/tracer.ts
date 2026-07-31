@@ -1,6 +1,6 @@
-import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import pc from "picocolors";
+import { tracePath } from "../config/paths.ts";
 
 // 一条 trace 事件的结构。所有方法最终都产出一个 TraceEvent 落盘。
 export interface TraceEvent {
@@ -86,8 +86,9 @@ export class Tracer {
   // 会话 id + 实验元数据,startSession 时锚定
   private sessionId = "";
   private meta: SessionMeta = { promptVersion: "?", systemPromptChars: 0, model: "?" };
-  // 落盘路径
-  private logPath = "logs/trace.jsonl";
+  // 落盘路径(见 config/paths.ts:全局 ~/.coderig/,不污染用户项目目录)。
+  // 函数惰性求值:Tracer 实例化可能早于 env 就绪(见 paths.ts 的设计说明)
+  private logPath = tracePath();
 
   // 会话开始:记一条 session_start(带实验元数据),生成 sessionId 并锚定 sessionStart
   startSession(meta?: SessionMeta) {
@@ -265,10 +266,13 @@ export class Tracer {
   // 用 promise 链把每次写串在上一次后面,保证文件里的行序 = 事件序
   private writeQueue: Promise<void> = Promise.resolve();
 
-  // 把单条事件追加写入 jsonl 文件(每行一个 JSON,流式友好、可 tail -f / jq)
+  // 把单条事件追加写入 jsonl 文件(每行一个 JSON,流式友好、可 tail -f / jq)。
+  // 保留 node:fs/promises appendFile:Bun.file().writer() 每次都要打开关闭,
+  // 不适合高频小追加(每事件一次),appendFile 是更直接的追加语义
   private persist(event: TraceEvent) {
     this.writeQueue = this.writeQueue.then(async () => {
       try {
+        const { appendFile, mkdir } = await import("node:fs/promises");
         await mkdir(dirname(this.logPath), { recursive: true });
         await appendFile(this.logPath, JSON.stringify(event) + "\n", "utf8");
       } catch {

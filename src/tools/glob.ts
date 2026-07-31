@@ -1,4 +1,3 @@
-import fg from "fast-glob";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
 export const globDef: ToolDef = {
@@ -29,14 +28,16 @@ export const globHandler: ToolHandler = async (args) => {
   if (!pattern) return "错误：缺少 pattern 参数";
   const cwd = args?.path || ".";
   try {
-    const matches = await fg(pattern, {
-      cwd,
-      onlyFiles: true,
-      // 默认会扫 node_modules 等噪声目录，忽略掉，避免结果爆炸
-      ignore: ["**/node_modules/**", "**/.git/**"],
-    });
-    if (matches.length === 0) return `未找到匹配 ${pattern} 的文件`;
-    return matches.join("\n"); // 一行一个路径，模型好读
+    // Bun.Glob 与 fast-glob 语义一致:**/*.ts 递归匹配任意层级,*.ts 只匹配顶层
+    const matches = await Array.fromAsync(
+      new Bun.Glob(pattern).scan({ cwd, onlyFiles: true }),
+    );
+    // 排除 node_modules 与 .git,避免结果爆炸
+    const filtered = matches.filter(
+      (f) => !f.includes("node_modules") && !f.includes("/.git/") && !f.startsWith(".git/"),
+    );
+    if (filtered.length === 0) return `未找到匹配 ${pattern} 的文件`;
+    return filtered.join("\n"); // 一行一个路径，模型好读
   } catch (e) {
     return `错误：搜索失败 ${e instanceof Error ? e.message : String(e)}`;
   }

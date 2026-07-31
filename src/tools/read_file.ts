@@ -1,5 +1,3 @@
-import { readFile, access } from "node:fs/promises";
-import { constants } from "node:fs";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
 
 // 默认一次读多少行:覆盖大多数"读一段确认内容"的探索场景,
@@ -48,12 +46,7 @@ export const readFileHandler: ToolHandler = async (args) => {
   );
 
   try {
-    try {
-      await access(path, constants.R_OK);
-    } catch {
-      return `错误：文件不存在 ${path}`;
-    }
-    const content = await readFile(path, "utf8");
+    const content = await Bun.file(path).text();
     const lines = content.split("\n");
     // 文件若以 \n 结尾,split 会多出一个末尾空串,视觉上不算一行,去掉
     if (content.endsWith("\n") && lines[lines.length - 1] === "") lines.pop();
@@ -75,7 +68,8 @@ export const readFileHandler: ToolHandler = async (args) => {
         ? `\n…(还有 ${total - end} 行,用 offset=${end + 1} 续读)`
         : "";
     return `${header}\n${body}${tail}`;
-  } catch (e) {
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return `错误：文件不存在 ${path}`;
     return `错误：读取文件失败 ${e instanceof Error ? e.message : String(e)}`;
   }
 };
