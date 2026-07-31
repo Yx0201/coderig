@@ -13,6 +13,7 @@ import {
   hasOversizedMsg,
   contextWindowTokens,
 } from "../history/context.ts";
+import { isDoomLoop, type CallSig } from "./doom_loop.ts";
 
 const tracer = new Tracer();
 
@@ -51,6 +52,48 @@ export async function startChat(resumeCid?: string) {
   // 由 permissions.ts 的 rememberable=false 保证进不了这个集合
   const sessionAllows = new Set<string>();
 
+  // 收尾轮:不带 tools 发最后一轮请求,模型只能输出文本。
+  // 用于"达到轮数上限"和"检测到死循环且用户选择停止"两种异常收尾——
+  // 硬停会把半截工作甩给用户,opencode 的做法是让模型自己交代
+  // 做到哪了、剩什么、建议下一步,信息价值天差地别
+  const finalSummaryRound = async (reason: string) => {
+    tracer.error(`进入收尾轮: ${reason}`);
+    process.stdout.write(pc.dim(`\n⊘ ${reason},让模型总结当前进度…\n`));
+    history.append({
+      role: "user",
+      content:
+        `[harness] ${reason}。工具调用已被禁用,不要再尝试调用任何工具。` +
+        `请用纯文本总结:1) 已完成了什么 2) 什么还没做完 3) 建议用户下一步怎么做。`,
+    });
+    loading.start();
+    let summary = "";
+    let started = false;
+    try {
+      for await (const event of sendMessages(history.contextMessages)) {
+        // 不传 tools:模型想继续调工具也调不了(协议层禁用,不靠提示词自觉)
+        if (!started) {
+          loading.stop();
+          started = true;
+        }
+        if (event.type === "content") {
+          process.stdout.write(event.text);
+          summary += event.text;
+        }
+      }
+    } catch (err) {
+      if (!started) loading.stop();
+      tracer.error(
+        `收尾轮请求失败: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      renderError("收尾轮也失败了,本轮工作到此为止");
+      return;
+    }
+    if (summary.trim()) {
+      history.append({ role: "assistant", content: summary });
+    }
+    process.stdout.write("\n");
+  };
+
   while (true) {
     const input = await p.text({
       message: "请输入信息",
@@ -67,6 +110,12 @@ export async function startChat(resumeCid?: string) {
     tracer.userMessage(input); // 记录用户本轮的输入(点事件)
 
     let rounds = 0;
+    // 轮数上限:codex 完全不设限、opencode 默认无限、gemini-cli 用 100。
+    // 之前的 10 轮硬顶会腰斩正常的长任务(一次真实重构轻松超过 10 轮工具调用)。
+    // 但云端 API 按 token 计费,失控循环是真金白银,不能照搬 codex 的"不设限"——
+    // 取一个"正常任务到不了、失控循环烧不光"的中间值,MAX_AGENT_ROUNDS 可覆盖。
+    // 注意:超限后不是硬停,而是走收尾轮(见 finalSummaryRound)
+    const MAX_ROUNDS = Number(process.env.MAX_AGENT_ROUNDS || 50);
     // 连续空回答计数:模型本轮无 content 也无 tool_calls 时 +1,有产出时归零。
     // 防止对"只想不答"的模型无限 nudge。超过上限就明确放弃,而不是静默结束
     let emptyRounds = 0;
@@ -74,10 +123,13 @@ export async function startChat(resumeCid?: string) {
     // nudge 文本:塞回 history 当一条 user 消息,把模型从"只想不说"拉回"给出回答或行动"
     const NUDGE_TEXT =
       "你上一轮只输出了思考,没有给出最终回答,也没有调用工具。请直接用正文回答用户,或调用工具继续完成任务。";
+    // doom loop 检测的调用序列:本用户回合内所有已执行的工具调用(按执行顺序)。
+    // 检测逻辑在 doom_loop.ts(纯函数,可单测)
+    const recentCalls: CallSig[] = [];
     while (true) {
       rounds++;
-      if (rounds > 10) {
-        renderError("达到最大轮数，停止");
+      if (rounds > MAX_ROUNDS) {
+        await finalSummaryRound(`达到最大轮数 ${MAX_ROUNDS}`);
         break;
       }
       tracer.nextRound();
@@ -257,6 +309,38 @@ export async function startChat(resumeCid?: string) {
 
       // 走到这里说明有工具调用:模型本轮有产出,空回答计数归零
       emptyRounds = 0;
+
+      // doom loop 检测(必须先于回填 assistant):把本轮调用并入序列,
+      // 看末尾是否连续 N 次完全相同。在回填之前检测——若用户选择停止,
+      // 带 tool_calls 的 assistant 根本没进转录,不会留下缺 tool 结果的孤儿
+      recentCalls.push(
+        ...toolCallsToRun.map((tc) => ({
+          name: tc.function.name,
+          args: tc.function.arguments,
+        })),
+      );
+      if (isDoomLoop(recentCalls)) {
+        const sig = recentCalls[recentCalls.length - 1]!;
+        const choice = await p.select({
+          message: `⚠ 检测到重复调用: ${sig.name} 已连续以相同参数调用多次,可能陷入死循环`,
+          options: [
+            { value: "continue" as const, label: "继续(可能是合法重试)" },
+            { value: "stop" as const, label: "停止并让模型总结当前进度" },
+          ],
+        });
+        const decision = p.isCancel(choice) || choice === "stop" ? "stop" : "continue";
+        tracer.doomLoop({
+          tool: sig.name,
+          args: sig.args.slice(0, 200),
+          decision,
+        });
+        if (decision === "stop") {
+          await finalSummaryRound(`检测到死循环(${sig.name} 重复调用),已停止`);
+          break;
+        }
+        // 用户选择继续:重置序列,给模型 N 次机会后再问一次,而不是每轮都问
+        recentCalls.length = 0;
+      }
 
       // 有工具调用：先回填 assistant（带 tool_calls + reasoning_content）。
       // reasoning_content 是 DeepSeek thinking 模式的硬协议:缺了它,

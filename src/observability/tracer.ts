@@ -19,6 +19,7 @@ export interface TraceEvent {
     | "nudge" // 空回答兜底:模型本轮无 content/tool_calls,harness 注入续轮提示
     | "compaction" // 上下文压缩:prompt_tokens 达阈值,旧历史被摘要替代(点事件,带切点/摘要长度)
     | "approval" // 权限门:一次人工确认(允许/会话放行/拒绝),A/B 时看模型尝试危险操作的频率
+    | "doom_loop" // 死循环检测:连续 N 次相同工具调用,带工具名/参数/用户决定
     | "retry" // LLM 请求重试:云端 API 抖动(429/5xx/网络错误),带次数/退避时长/原因
     | "error"; // 错误
   ts: number; // 相对 session 开始的毫秒
@@ -235,6 +236,12 @@ export class Tracer {
     reason: string;
   }) {
     this.push("retry", info);
+  }
+
+  // 死循环检测:模型连续 N 次发出完全相同的工具调用(同名同参)。
+  // 记工具名、参数(截断)和用户的决定——A/B 时能看出哪版提示词更容易让模型卡死
+  doomLoop(info: { tool: string; args: string; decision: "continue" | "stop" }) {
+    this.push("doom_loop", info);
   }
 
   // 错误:记 error 事件
