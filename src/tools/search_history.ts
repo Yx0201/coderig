@@ -18,8 +18,9 @@ export const searchHistoryDef: ToolDef = {
   function: {
     name: "search_history",
     description:
-      "搜索过去的对话历史记录(跨所有历史会话)。用于回忆之前对话里讨论过的决定、结论、文件改动等。" +
-      "返回命中消息的会话id、角色和上下文片段。",
+      "搜索过去的对话历史记录(跨所有历史会话)。适用:回忆之前对话里讨论过的决定、结论、文件改动,或追问之前提过的细节。" +
+      "不适用:搜索当前项目代码(用 grep)。返回命中消息的会话id、角色和上下文片段;用 cid 参数可缩小到某段会话。" +
+      "命中最多 15 条——关键词要具体,别搜太宽。",
     parameters: {
       type: "object",
       properties: {
@@ -37,6 +38,7 @@ export const searchHistoryDef: ToolDef = {
         },
       },
       required: ["query"],
+      additionalProperties: false,
     },
   },
 };
