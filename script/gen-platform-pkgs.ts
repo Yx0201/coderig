@@ -17,7 +17,7 @@ const TARGETS = [
   { os: "windows", arch: "x64", name: "coderig-windows-x64" },
 ];
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 for (const { os, arch, abi, name } of TARGETS) {
   const dir = join("dist", name);

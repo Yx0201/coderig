@@ -1,6 +1,6 @@
 {
   "name": "coderig",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "终端编码助手 — 学习用 mini agent harness",
   "license": "MIT",
   "repository": {
@@ -23,12 +23,12 @@
   "os": ["darwin", "linux", "win32"],
   "cpu": ["arm64", "x64"],
   "optionalDependencies": {
-    "coderig-darwin-arm64": "0.1.0",
-    "coderig-darwin-x64": "0.1.0",
-    "coderig-linux-x64": "0.1.0",
-    "coderig-linux-arm64": "0.1.0",
-    "coderig-linux-x64-musl": "0.1.0",
-    "coderig-windows-x64": "0.1.0"
+    "coderig-darwin-arm64": "0.2.0",
+    "coderig-darwin-x64": "0.2.0",
+    "coderig-linux-x64": "0.2.0",
+    "coderig-linux-arm64": "0.2.0",
+    "coderig-linux-x64-musl": "0.2.0",
+    "coderig-windows-x64": "0.2.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
