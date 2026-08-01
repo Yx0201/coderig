@@ -3,16 +3,19 @@ import { setupTools } from "./src/tools/index.ts";
 import { History } from "./src/history/store.ts";
 import { loadConfig, setConfig } from "./src/config/index.ts";
 import { runSetup } from "./src/cli/setup.ts";
+import { listSnapshotsCmd, restoreCmd } from "./src/cli/snapshot_cmd.ts";
 
 // coderig:终端编码助手
 //
 // 用法:
-//   coderig                  在当前目录开始新对话
-//   coderig --resume <cid>   续话指定对话
-//   coderig --list           列出历史对话
-//   coderig config           重新跑配置向导
-//   coderig --version        版本号
-//   coderig --help           显示帮助
+//   coderig                    在当前目录开始新对话
+//   coderig --resume <cid>     续话指定对话
+//   coderig --list             列出历史对话
+//   coderig --snapshots [cid]  列出改动快照(可加会话 id)
+//   coderig --restore <cid> <path>  恢复该文件的快照内容(覆盖前确认)
+//   coderig config             重新跑配置向导
+//   coderig --version          版本号
+//   coderig --help             显示帮助
 
 const VERSION = "0.1.0";
 
@@ -22,12 +25,14 @@ function showHelp() {
   console.log(`coderig v${VERSION} — 终端编码助手
 
 用法:
-  coderig                  在当前目录开始新对话
-  coderig --resume <cid>   续话指定对话
-  coderig --list           列出历史对话
-  coderig config           重新跑配置向导
-  coderig --version        版本号
-  coderig --help           显示帮助
+  coderig                      在当前目录开始新对话
+  coderig --resume <cid>       续话指定对话
+  coderig --list               列出历史对话
+  coderig --snapshots [cid]    列出改动快照(可加会话 id)
+  coderig --restore <cid> <path>  恢复该文件的快照内容(覆盖前确认)
+  coderig config               重新跑配置向导
+  coderig --version            版本号
+  coderig --help               显示帮助
 
 配置: 首次运行自动引导,或手动编辑 ~/.coderig/config.json
 `);
@@ -68,6 +73,22 @@ async function main() {
         );
       }
     }
+    return;
+  }
+
+  // 快照:列出/恢复不需要 LLM 配置(改动快照给"模型改错文件"留底)
+  if (args[0] === "--snapshots") {
+    await listSnapshotsCmd(args[1]);
+    return;
+  }
+  if (args[0] === "--restore") {
+    const cid = args[1];
+    const path = args[2];
+    if (!cid || !path) {
+      console.log("用法:coderig --restore <cid> <path>");
+      return;
+    }
+    await restoreCmd(cid, path);
     return;
   }
 

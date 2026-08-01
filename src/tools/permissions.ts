@@ -41,6 +41,7 @@ const DANGEROUS_PATTERNS: RegExp[] = [
   /\|\s*(sudo\s+)?(ba|z)?sh\b/, // curl … | sh 这类管道执行
   /\bchmod\s+-[a-zA-Z]*R/,
   /\bchown\s+-[a-zA-Z]*R/,
+  />\s*[^|]*\.env\b/, // 重定向写 .env(如 cat > .env):等于直写敏感文件,与 write_file 写 .env 同风险
 ];
 
 // 只读命令白名单:整条命令(含管道每一段)都命中才 auto 放行。
@@ -57,7 +58,14 @@ const READONLY_ESCAPE = [
   /\b(bunx\s+)?tsc\b(?![^|]*--noEmit)/, // tsc 不带 --noEmit 会输出编译产物(写文件)
 ];
 
-export type BashLevel = "readonly" | "normal" | "dangerous";
+// bash 命令串里的敏感路径引用:比 SENSITIVE_PATH(路径值专用)宽松——
+// 命令串里路径前是空格/引号/参数,不能用 (^|\/) 锚点。
+// cat .env / cat .env | head / grep KEY ~/.ssh/authorized_keys / head ~/.aws/credentials 都命中。
+// .env 后允许跟 .local 之类、空格、管道或结尾;src/app.env.ts 这类源码文件会保守多问(宁可多问)
+const BASH_SENSITIVE_REF =
+  /\.env(\.|\s|$|\|)|\.(pem|key|p12|pfx)\b|id_(rsa|ed25519|ecdsa)\b|\.ssh\/|\.aws\/|\.gnupg\//;
+
+export type BashLevel = "readonly" | "normal" | "dangerous" | "sensitive";
 
 export function classifyBash(cmd: string): BashLevel {
   if (DANGEROUS_PATTERNS.some((re) => re.test(cmd))) return "dangerous";
@@ -70,7 +78,12 @@ export function classifyBash(cmd: string): BashLevel {
     (seg) =>
       READONLY_CMD.test(seg) && !READONLY_ESCAPE.some((re) => re.test(seg)),
   );
-  return allReadonly ? "readonly" : "normal";
+  if (!allReadonly) return "normal";
+  // 只读命令但引用敏感路径(cat .env / grep KEY ~/.ssh/…):内容照发云端,
+  // 与 read_file 读敏感路径同风险——bash 不能绕过路径级保护(评审追问)。
+  // 降级为 sensitive:每次都问,不可会话放行(rememberable=false)
+  if (BASH_SENSITIVE_REF.test(cmd)) return "sensitive";
+  return "readonly";
 }
 
 // ---- 敏感路径 ----
@@ -89,13 +102,25 @@ const preview = (s: string) =>
 
 // sessionAllows:会话级 allowlist(工具名集合),用户在确认提示里选
 // "本会话不再询问 X" 时加入。危险命令/敏感路径不走它(rememberable=false)
+// denyTools:配置级硬禁(settings.json 的 permissions.deny),deny-wins——命中即 deny,
+// 问都不问。与敏感路径硬禁的区别:这是"用户/配置级"禁止,敏感路径是"策略级"禁止
 export function checkPermission(
   toolName: string,
   args: unknown,
   sessionAllows: ReadonlySet<string>,
+  denyTools: ReadonlySet<string> = new Set(),
 ): PermissionDecision {
   const a = args as Record<string, unknown> | null;
   const path = typeof a?.path === "string" ? (a.path as string) : "";
+
+  // 0. deny-wins:配置里硬禁止的工具直接 deny(先于一切判定)
+  if (denyTools.has(toolName)) {
+    return {
+      action: "deny",
+      reason: `工具 ${toolName} 已在配置中禁止(settings.json permissions.deny)`,
+      rememberable: false,
+    };
+  }
 
   // 1. 敏感路径优先于一切:直读逐次问,直写硬禁
   if (path && SENSITIVE_PATH.test(path)) {
@@ -127,6 +152,15 @@ export function checkPermission(
       };
     }
     if (level === "readonly") return { action: "auto", reason: "", rememberable: false };
+    if (level === "sensitive") {
+      // cat .env 这类:与 read_file 读敏感路径同风险,逐次问、不可会话放行。
+      // 放在 sessionAllows 之前——即使用户"本会话不再询问 bash"也拦得住
+      return {
+        action: "ask",
+        reason: `读取敏感文件(内容会发往云端 API): ${preview(cmd)}`,
+        rememberable: false,
+      };
+    }
     if (sessionAllows.has("bash"))
       return { action: "auto", reason: "", rememberable: false };
     return {

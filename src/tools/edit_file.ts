@@ -1,4 +1,6 @@
+import { resolve } from "node:path";
 import type { ToolDef, ToolHandler } from "../llm/types.ts";
+import { sha256 } from "./snapshot.ts";
 
 // 改动区回显的上下文行数:前后各几行,让模型看到改动落点的邻居,行号即下一轮编辑的锚点
 const CONTEXT_LINES = 1;
@@ -8,8 +10,11 @@ export const editFileDef: ToolDef = {
   function: {
     name: "edit_file",
     description:
-      "对已存在文件做局部修改。两种模式二选一:" +
-      "(1) oldString/newString:把文件中【唯一出现的】oldString 替换为 newString,oldString 必须精确唯一匹配;" +
+      "对已存在文件做局部修改。适用:小范围改动(改一个函数/一段逻辑),比 write_file 省 token 且不易误伤。" +
+      "不适用:新建文件、要整文件替换内容(用 write_file)。" +
+      "编辑前必须先 read_file 读取该文件(harness 强制);文件在读取后被外部改过会被拒绝,需重读。" +
+      "两种模式二选一:" +
+      "(1) oldString/newString:把文件中【唯一出现的】oldString 替换为 newString,oldString 必须精确唯一匹配(含缩进/空白);" +
       "(2) start_line/end_line + newString:替换指定行号区间(行号从 read_file 获得),确定性锚点,无需复现精确文本。" +
       "成功后回显改动区及行号,作为下一轮编辑的锚点,避免靠记忆复现文本产生幻觉。",
     parameters: {
@@ -37,6 +42,7 @@ export const editFileDef: ToolDef = {
         },
       },
       required: ["path", "newString"],
+      additionalProperties: false,
     },
   },
 };
@@ -51,14 +57,27 @@ function formatRegion(lines: string[], from: number, to: number): string {
   return out.join("\n");
 }
 
-export const editFileHandler: ToolHandler = async (args) => {
+export const editFileHandler: ToolHandler = async (args, ctx) => {
   const path = args?.path;
   const newString = args?.newString ?? null;
   if (!path) return "错误：缺少 path 参数";
   if (newString === null) return "错误：缺少 newString 参数";
 
   try {
+    const abs = resolve(path);
+    // read-before-write 门:没读过就编辑,锚点从哪来?直接拦下让模型先读
+    if (!ctx.readPaths.has(abs)) {
+      ctx.gate({ kind: "read_before_write", path });
+      return "错误：编辑前必须先 read_file 读取该文件的当前内容(拿到行号/内容作锚点),再执行 edit_file";
+    }
     const content = await Bun.file(path).text();
+    // 冲突检测:文件在会话读到之后被外部/其它工具改过(on-disk 指纹 ≠ 会话已知指纹),
+    // 行号/oldString 都基于过期内容,拦下让模型重读
+    const known = ctx.fileStates.get(abs);
+    if (known && known.hash !== sha256(content)) {
+      ctx.gate({ kind: "conflict", path });
+      return "错误：文件自上次读取后已被修改(可能被外部或其它工具改动),请重新 read_file 拿到最新内容/行号后再编辑";
+    }
     const trailingNl = content.endsWith("\n");
 
     let next: string;
@@ -105,7 +124,12 @@ export const editFileHandler: ToolHandler = async (args) => {
       return "错误：需提供 oldString(模式1)或 start_line+end_line(模式2),二选一";
     }
 
-    await Bun.write(path, next);
+    // 写前快照:给"改错了可回滚"留底
+    await ctx.snapshot(path);
+    await Bun.write(abs, next);
+    // 写成功 = 会话知道这份新内容,更新指纹与已读标记(连续编辑不被误判冲突)
+    ctx.fileStates.set(abs, { hash: sha256(next) });
+    ctx.readPaths.add(abs);
 
     // 回显改动区(带行号):给模型"操作后的新鲜锚点",下一轮编辑可直接用行号定位,不靠记忆
     const newLines = next.split("\n");
