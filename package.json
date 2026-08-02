@@ -1,7 +1,7 @@
 {
   "name": "coderig",
   "version": "0.2.0",
-  "description": "终端编码助手 — 学习用 mini agent harness",
+  "description": "兼容 DeepSeek API 的终端编程 harness — agent loop / 工具系统 / 权限门 / 上下文管理 / 可观测性",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,7 +14,8 @@
   "files": [
     "bin",
     "postinstall.mjs",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "scripts": {
     "build": "bun run script/build.ts",
@@ -31,9 +32,17 @@
     "coderig-windows-x64": "0.2.0"
   },
   "devDependencies": {
-    "@types/bun": "latest",
     "@clack/prompts": "^1.7.0",
+    "@types/bun": "latest",
+    "@types/lowlight": "^2.0.1",
+    "@types/marked": "^6.0.0",
+    "@types/react": "^19.2.18",
     "cli-spinners": "^3.4.0",
-    "picocolors": "^1.1.1"
+    "ink": "^7.1.1",
+    "lowlight": "^3.3.0",
+    "marked": "^18.0.7",
+    "picocolors": "^1.1.1",
+    "react": "^19.2.8",
+    "react-devtools-core": "^7.0.1"
   }
 }
