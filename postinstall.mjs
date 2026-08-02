@@ -15,6 +15,21 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
+
+// ===== 源码仓库自装守卫 =====
+// 被 npm 安装的壳包一定位于某个 node_modules 目录下
+// (全局:<prefix>/lib/node_modules/coderig,本地:<proj>/node_modules/coderig);
+// 而源码仓库里跑 npm install 时,__dirname = 仓库根目录,父目录名不是 node_modules。
+// 后一种场景必须跳过:postinstall 会把平台包二进制(硬)链接到本目录的 bin/coderig,
+// 在仓库里执行就会把 63MB 的编译产物覆盖进被 git 跟踪的占位脚本,
+// 造成 bin/coderig 意外变更、git 工作区变脏(踩过:dist 产物被 link 到 bin/coderig)。
+const inNodeModules = path.basename(path.dirname(__dirname)) === "node_modules";
+if (!inNodeModules) {
+  console.log(
+    "coderig: 检测到源码仓库目录,跳过 postinstall(不覆盖 bin/coderig 占位脚本)",
+  );
+  process.exit(0);
+}
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, "package.json"), "utf8"),
 );
