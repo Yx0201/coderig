@@ -41,9 +41,10 @@ export async function* sendMessages(
     messages: [
       ...(sys.content ? [{ role: "system", content: sys.content }] : []),
       ...messages,
-      // 运行时状态作为消息尾部注入(评审 P2-2):system 是请求最前缀,
-      // 拼进 sys 会让 DeepSeek 上下文缓存从首个 token 起 miss;
-      // 放尾部不污染前缀,缓存照常命中
+      // [DeepSeek适配] 运行时状态放消息尾部而非拼进 system(评审 P2-2):
+      // DeepSeek 上下文缓存对前缀敏感,前缀首个 token 一变整体 miss;
+      // 放尾部不污染静态前缀,缓存照常命中。
+      // 验证点:模型升级时确认缓存前缀敏感行为未变;若缓存机制取消,可移回 system 简化
       ...(opts?.runtime ? [{ role: "user", content: opts.runtime }] : []),
     ],
     tools,

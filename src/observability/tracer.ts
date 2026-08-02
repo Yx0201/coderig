@@ -61,6 +61,15 @@ export interface SessionSummary {
   toolFailures: number; // 工具失败次数(ok:false),提示词是否改善工具纪律看这个
 }
 
+// 工具结果的"结构化展示"载荷:渲染层要自己决定怎么画(TUI 画卡片、只显示名字+结果摘要),
+// 所以给它字段而不是一整行文本。这只是展示口径,与落盘的 tool_result 事件互不影响
+export interface ToolDisplay {
+  name: string;
+  result: string; // 已截断的结果预览
+  ok: boolean;
+  duration: number; // ms
+}
+
 // 工具结果/参数预览的最大长度,防止 13k 的 html content 撑爆 trace 文件
 const PREVIEW_LEN = 200;
 // 单条 SSE 原始报文的截断长度:逐 chunk 截断而非整体截断,
@@ -92,6 +101,39 @@ export class Tracer {
   // 函数惰性求值:Tracer 实例化可能早于 env 就绪(见 paths.ts 的设计说明)
   private logPath = tracePath();
 
+  // 终端展示出口:默认直接写 process.stdout(线性模式字节与改造前一致);
+  // TUI 模式注入到 notice 块 store,让这些"一次性提示行"不污染 Ink 帧。
+  // 落盘走 persist()(独立文件),与此完全解耦 —— 约束2不变量就是 persist 不动。
+  // 注意不要把持久化(写文件)塞进 displaySink:那是观测数据,不能因为终端挂了而丢。
+  private displaySink: (text: string) => void;
+
+  // 工具结果的展示出口单独开一个"结构化"口子:文本 sink 只能收一整行,渲染层拿不到
+  // name/ok/duration 就画不出卡片(TUI 需要"工具名 + 结果摘要",不要参数原文)。
+  // 没注入时退回 displaySink 的单行文本 —— 线性模式字节与改造前一致。
+  private toolDisplaySink: ((info: ToolDisplay) => void) | null = null;
+
+  constructor(opts?: { displaySink?: (text: string) => void }) {
+    this.displaySink = opts?.displaySink ?? ((text) => process.stdout.write(text));
+  }
+
+  // 运行期重定向展示出口:chat.ts 里 tracer 以默认(写 stdout)构造,若之后切到
+  // TUI 模式,用它把 4 条一次性提示行改指到 notice 块 store。持久化不受任何影响
+  setDisplaySink(sink: (text: string) => void) {
+    this.displaySink = sink;
+  }
+
+  // 工具结果展示改走结构化 sink(TUI 用它画工具卡片)。落盘一行不受影响
+  setToolDisplaySink(sink: (info: ToolDisplay) => void) {
+    this.toolDisplaySink = sink;
+  }
+
+  // 终端展示出口的唯一入口:四个"一次性提示行"(endSession/toolResult/nudge/compaction)
+  // 都走它。displaySink 是纯展示,失败/重定向都不影响已入队的持久化事件(push 先落盘再 emit)
+  private emit(text: string) {
+    // 展示在 push 之后调用(见各方法),事件已同步排队写入磁盘队列,终端出问题不丢观测
+    this.displaySink(text);
+  }
+
   // 会话开始:记一条 session_start(带实验元数据),生成 sessionId 并锚定 sessionStart
   startSession(meta?: SessionMeta) {
     this.sessionStart = Date.now();
@@ -115,7 +157,7 @@ export class Tracer {
     this.push("session_end", summary);
     // 终端打一行汇总:实验组 / 轮数 / 总耗时 / 双向 token / 工具成败
     const sec = (summary.totalDuration / 1000).toFixed(1);
-    process.stdout.write(
+    this.emit(
       `\n✓ 完成 [${summary.promptVersion}] · ${summary.totalRounds} 轮 · ${sec}s` +
         ` · ↑${summary.totalPromptTokens} ↓${summary.totalTokens} tokens` +
         ` · 工具 ${summary.toolCalls} 次(失败 ${summary.toolFailures})\n`,
@@ -180,9 +222,11 @@ export class Tracer {
       duration: start ? Date.now() - start.startTs : 0, // 找不到配对(不应发生)时记 0,不致崩
     });
     const dur = event.duration ?? 0;
-    process.stdout.write(
-      `\n🔧 ${name}(${start?.argsPreview ?? ""}) → ${resultPreview} · ${dur}ms\n`,
-    );
+    if (this.toolDisplaySink) {
+      this.toolDisplaySink({ name, result: resultPreview, ok, duration: dur });
+      return;
+    }
+    this.emit(`\n🔧 ${name}(${start?.argsPreview ?? ""}) → ${resultPreview} · ${dur}ms\n`);
   }
 
   // 用户消息:记一条 user_message(点事件),text 截断后存。用于回放"用户每轮问了啥"
@@ -203,14 +247,14 @@ export class Tracer {
   // reason 记原因(finish_reason 等),终端打一行灰色提示让用户知道发生了啥(不是静默结束)
   nudge(reason: string) {
     this.push("nudge", { reason });
-    process.stdout.write(pc.dim(`\n↻ 续轮提示:模型本轮无回答/无工具调用(${reason}),已注入提示继续\n`));
+    this.emit(pc.dim(`\n↻ 续轮提示:模型本轮无回答/无工具调用(${reason}),已注入提示继续\n`));
   }
   
   // 上下文压缩:记切点/摘要长度/触发时的 prompt_tokens,终端打灰色提示。
   // 这是观察压缩策略好坏的核心事件:压得太勤/摘要太长都靠它看趋势
   compaction(info: { cutIndex: number; summaryLen: number; promptTokens: number }) {
     this.push("compaction", info);
-    process.stdout.write(
+    this.emit(
       pc.dim(
         `\n⊘ 上下文压缩:prompt_tokens=${info.promptTokens} 达阈值,前 ${info.cutIndex} 条已折叠为 ${info.summaryLen} 字摘要\n`,
       ),
