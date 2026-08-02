@@ -1,6 +1,6 @@
 {
   "name": "coderig",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "兼容 DeepSeek API 的终端编程 harness — agent loop / 工具系统 / 权限门 / 上下文管理 / 可观测性",
   "license": "MIT",
   "repository": {
@@ -24,12 +24,12 @@
   "os": ["darwin", "linux", "win32"],
   "cpu": ["arm64", "x64"],
   "optionalDependencies": {
-    "coderig-darwin-arm64": "0.2.0",
-    "coderig-darwin-x64": "0.2.0",
-    "coderig-linux-x64": "0.2.0",
-    "coderig-linux-arm64": "0.2.0",
-    "coderig-linux-x64-musl": "0.2.0",
-    "coderig-windows-x64": "0.2.0"
+    "coderig-darwin-arm64": "0.3.0",
+    "coderig-darwin-x64": "0.3.0",
+    "coderig-linux-x64": "0.3.0",
+    "coderig-linux-arm64": "0.3.0",
+    "coderig-linux-x64-musl": "0.3.0",
+    "coderig-windows-x64": "0.3.0"
   },
   "devDependencies": {
     "@clack/prompts": "^1.7.0",

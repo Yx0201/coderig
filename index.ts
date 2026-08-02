@@ -1,3 +1,4 @@
+import pkg from "./package.json" with { type: "json" };
 import { startChat } from "./src/cli/chat.ts";
 import { setupTools } from "./src/tools/index.ts";
 import { History } from "./src/history/store.ts";
@@ -17,7 +18,8 @@ import { listSnapshotsCmd, restoreCmd } from "./src/cli/snapshot_cmd.ts";
 //   coderig --version          版本号
 //   coderig --help             显示帮助
 
-const VERSION = "0.1.0";
+// 版本号从 package.json 读(编译时被 Bun 内联进二进制),发布改版本只需改 package.json
+const VERSION = pkg.version;
 
 const [, , ...args] = process.argv;
 
