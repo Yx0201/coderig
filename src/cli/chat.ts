@@ -1,8 +1,6 @@
-import * as p from "@clack/prompts";
-import { renderLoading, renderError } from "./render.ts";
 import type { ChatMessage, ToolCall } from "../llm/types.ts";
 import { sendMessages } from "../llm/client.ts";
-import pc from "picocolors";
+import { createTerm, isCancel, type Term } from "./tui/term.ts";
 import { get, listDefs, type ToolEntry } from "../tools/registry.ts";
 import { checkPermission, classifyBash } from "../tools/permissions.ts";
 import { planGuardViolation } from "../tools/plan_mode.ts";
@@ -50,13 +48,13 @@ export async function startChat(resumeCid?: string) {
     model,
     cid: history.cid,
   });
-  process.stdout.write(
+  const term = createTerm({ tracer });
+  term.notify(
     resumeCid
       ? `welcome back! 续话 ${history.cid} (${history.messages.length} 条历史消息)\n`
       : `welcome to the chat! 新对话 ${history.cid}\n`,
   );
-
-  const loading = renderLoading();
+  term.setStatus(model);
   // 配置级权限(settings.json):allow 种子进会话放行名单,deny 既硬禁止又从模型可见列表隐藏。
   // 会话级放行名单:用户在确认提示里选"本会话不再询问 X"时加入。
   // 只记工具名粒度(bash/write_file/edit_file);危险命令与敏感路径不可放行,
@@ -70,12 +68,8 @@ export async function startChat(resumeCid?: string) {
   const ctx = createSessionContext({
     snapshot: (path) => snapshotStore.snapshot(path),
     // 审批 UI 钩子:exit_plan_mode 提交计划时弹确认,用户批准才切回正常模式。
-    // 注意 p.confirm 返回 boolean|symbol:点"否"是 false(不是 cancel symbol),
-    // 直接 !isCancel() 会把"否"取反成"是"——必须同时检查 r === true(评审 P0-2)
-    confirm: async (msg) => {
-      const r = await p.confirm({ message: msg });
-      return !p.isCancel(r) && r === true;
-    },
+    // 实现交给 term(Linear 用 Clack p.confirm,TUI 用帧内模态),语义都是 "批准才返回 true"
+    confirm: (msg) => term.confirm(msg),
   });
 
   // 收尾轮:不带 tools 发最后一轮请求,模型只能输出文本。
@@ -84,55 +78,53 @@ export async function startChat(resumeCid?: string) {
   // 做到哪了、剩什么、建议下一步,信息价值天差地别
   const finalSummaryRound = async (reason: string) => {
     tracer.error(`进入收尾轮: ${reason}`);
-    process.stdout.write(pc.dim(`\n⊘ ${reason},让模型总结当前进度…\n`));
+    term.notify(`\n⊘ ${reason},让模型总结当前进度…\n`, "dim");
     history.append({
       role: "user",
       content:
         `[harness] ${reason}。工具调用已被禁用,不要再尝试调用任何工具。` +
         `请用纯文本总结:1) 已完成了什么 2) 什么还没做完 3) 建议用户下一步怎么做。`,
     });
-    loading.start();
+    term.start();
     let summary = "";
-    let started = false;
     try {
       for await (const event of sendMessages(history.contextMessages)) {
         // 不传 tools:模型想继续调工具也调不了(协议层禁用,不靠提示词自觉)
-        if (!started) {
-          loading.stop();
-          started = true;
-        }
         if (event.type === "content") {
-          process.stdout.write(event.text);
+          term.onContent(event.text); // onContent 内部已幂等停 spinner
           summary += event.text;
         }
       }
     } catch (err) {
-      if (!started) loading.stop();
+      term.end(); // 收尾:定格 spinner + 把已流出的半截内容落定(漏调会留在 live 区串到下一轮)
       tracer.error(
         `收尾轮请求失败: ${err instanceof Error ? err.message : String(err)}`,
       );
-      renderError("收尾轮也失败了,本轮工作到此为止");
+      term.error("收尾轮也失败了,本轮工作到此为止");
       return;
     }
+    term.end(); // 流正常结束:live 区的总结落定进历史块
     if (summary.trim()) {
       history.append({ role: "assistant", content: summary });
     }
-    process.stdout.write("\n");
+    term.notify("");
   };
 
   while (true) {
-    const input = await p.text({
-      message: "请输入信息",
-    });
+    const input = await term.promptInput();
 
-    if (p.isCancel(input)) {
+    if (isCancel(input)) {
+      // 顺序要紧:先卸载 TUI 恢复终端,再打汇总/告别 —— 反过来的话这两行会被塞进
+      // 已经不再渲染的 Ink 帧里(store 在 shutdown 后把提示直写 stdout,见 TuiStore.pushNotice)
+      term.shutdown();
       tracer.endSession();
-      console.log("Bey~");
+      term.notify("Bey~\n");
       break;
     }
 
     if (!input.trim()) continue;
     history.append({ role: "user", content: input });
+    term.showUser(input); // TUI 回卷里显示用户一问;linear no-op
     tracer.userMessage(input); // 记录用户本轮的输入(点事件)
 
     let rounds = 0;
@@ -162,17 +154,12 @@ export async function startChat(resumeCid?: string) {
       tracer.llmStart();
       let answer = "";
       let reasoning = ""; // 本轮推理原文:带 tool_calls 的 assistant 消息必须原样存回 history
-      loading.start();
-      let started = false;
+      term.start(); // 请求前启动"请求中" spinner(渲染状态机在 LinearTerm 内部)
       let toolCallsToRun: ToolCall[] | null = null;
       let contentLen = 0;
       let reasoningLen = 0;
       let currentUsage: any;
       let currentFinishReason: string | null = null; // 本轮 finish_reason,判停兜底用
-      let lastType: "reasoning" | "content" | "tool_calls" | null = null;
-      // 工具参数进度行是否已占一行:首个进度事件先换行(不盖住在流的 reasoning),
-      // 后续进度用 \r 原地刷新;content/reasoning 到来时复位
-      let progressActive = false;
       try {
         for await (const event of sendMessages(
           history.contextMessages, // 发送视图:压缩/裁剪后的投影,而非完整转录(见 history/context.ts)
@@ -183,36 +170,17 @@ export async function startChat(resumeCid?: string) {
             runtime: runtimeReminder(ctx.state.mode, ctx.todos),
           },
         )) {
-          if (!started) {
-            loading.stop();
-            // 清除 loading 文本
-            started = true;
-          }
-          if (event.type === "reasoning" && lastType !== "reasoning") {
-            process.stdout.write("\n[推理]: "); // 仅进入 reasoning 时打一次前缀
-          }
-          if (event.type === "content" && lastType === "reasoning") {
-            process.stdout.write("\n"); // 思考→回答 切换，换行分隔
-          }
-          // raw/finish/retry/tool_call_progress 是纯观测事件,不参与渲染、也不影响 lastType(否则会把"思考→回答"分隔逻辑带歪)
-          if (
-            event.type !== "usage" &&
-            event.type !== "raw" &&
-            event.type !== "finish" &&
-            event.type !== "retry" &&
-            event.type !== "tool_call_progress"
-          )
-            lastType = event.type;
+          // ===== 渲染全部委托给 term:reasoning/content/retry/进度 按 delta 增量喂,
+          //     内部管 spinner / 光标 / 进度行;usage/finish/tool_calls 只记状态;raw 落盘。
+          //     思考原文仍在此全量累积进 reasoning(DeepSeek 协议硬要求),显示层另走 term
           switch (event.type) {
             case "content":
-              progressActive = false;
-              process.stdout.write(event.text);
+              term.onContent(event.text);
               answer += event.text;
               contentLen += event.text.length;
               break;
             case "reasoning":
-              progressActive = false;
-              process.stdout.write(pc.dim(event.text));
+              term.onReasoning(event.text);
               reasoning += event.text;
               reasoningLen += event.text.length;
               break;
@@ -229,31 +197,17 @@ export async function startChat(resumeCid?: string) {
               tracer.llmRaw(event.data); // 本轮原始 SSE 报文落盘,诊断 think/content 用
               break;
             case "retry":
-              // 云端 API 抖动,client 层退避后将自动重发。落盘 + 终端提示,
-              // 让用户知道"卡住"是在等退避,而不是程序死了
+              // 云端 API 抖动,client 层退避后将自动重发。落盘由 tracer 处理,终端提示交给 term
               tracer.retry(event);
-              process.stdout.write(
-                pc.dim(
-                  `\n⟳ 请求失败(${(event.reason ?? "").slice(0, 120)}),${(event.delayMs / 1000).toFixed(1)}s 后重试(${event.attempt}/${event.maxAttempts})\n`,
-                ),
-              );
+              term.onRetry(event);
               break;
             case "tool_call_progress":
-              // 模型正在流式生成工具参数(write_file 写整文件时可达十几秒)。
-              // 首个进度先换行(不盖住正在流的 reasoning),之后 \r 原地刷新一行
-              if (!progressActive) {
-                process.stdout.write("\n");
-                progressActive = true;
-              }
-              process.stdout.write(
-                `\r${" ".repeat(60)}\r` +
-                  pc.dim(
-                    `⏳ 正在生成 ${event.name ?? "工具调用"} 的参数… ${event.argsChars} 字符`,
-                  ),
-              );
+              term.onToolCallProgress(event.name, event.argsChars);
               break;
           }
         }
+        // 流正常结束(可能只吐了 reasoning):收尾 spinner(思考态定格 / 兜底停)
+        term.end();
         // 一轮流完,记一次 llm_end(本轮元信息 + usage + finish_reason),在循环外只调一次
         tracer.llmEnd({
           contentLen,
@@ -262,14 +216,24 @@ export async function startChat(resumeCid?: string) {
           finishReason: currentFinishReason,
           usage: currentUsage,
         });
+        // header 实时刷新 token(TUI 固定头用;linear no-op)
+        if (currentUsage) {
+          term.setStatus(model, {
+            prompt: currentUsage.prompt_tokens,
+            completion: currentUsage.completion_tokens,
+          });
+        }
       } catch (err) {
         const msg = `请求失败: ${err instanceof Error ? err.message : String(err)}`;
-        if (!started) loading.stop();
+        // 思考中途请求挂了:先定格思考行(错误信息不能压在转着的 spinner 上)
+        term.end();
         tracer.error(msg); // 记错误事件
-        renderError(msg);
+        term.error(msg);
         break; // 请求失败：跳出 agent loop，不执行工具、不保存半截回答
       } finally {
-        if (!started) loading.stop();
+        // 兜底:无论走哪条路径,离开本轮时 spinner 一定不能还在转
+        // (term.stop 幂等,已 end/已 stop 时是 no-op)
+        term.stop();
       }
 
       // 上下文压缩检查:用本轮 API 返回的真实 prompt_tokens 对阈值(不做本地估算)。
@@ -277,7 +241,7 @@ export async function startChat(resumeCid?: string) {
       // 避免超阈值的大上下文再被原样发一次。压缩失败只记错降级继续,不能搞崩对话
       if (currentUsage && shouldCompact(currentUsage.prompt_tokens)) {
         // 压缩要调一次 LLM 生成摘要,可能几秒——先打一行,别让用户以为卡死
-        process.stdout.write(pc.dim("\n⊘ 正在压缩上下文(调用模型生成摘要)…\n"));
+        term.notify("\n⊘ 正在压缩上下文(调用模型生成摘要)…\n", "dim");
         try {
           const r = await history.compact();
           if (r) {
@@ -310,7 +274,7 @@ export async function startChat(resumeCid?: string) {
         // finish_reason=length:被截断,nudge 无益(还会被截),记下并终止
         if (currentFinishReason === "length") {
           tracer.error("本轮被截断(finish_reason=length),可能上下文过长");
-          renderError("模型输出被截断,本轮无完整回答");
+          term.error("模型输出被截断,本轮无完整回答");
           if (answer.trim())
             history.append({ role: "assistant", content: answer });
           break;
@@ -326,7 +290,7 @@ export async function startChat(resumeCid?: string) {
         emptyRounds++;
         if (emptyRounds > MAX_NUDGE) {
           tracer.error(`连续 ${emptyRounds} 轮无回答,放弃本轮`);
-          renderError("模型多次未给出回答,已停止");
+          term.error("模型多次未给出回答,已停止");
           break;
         }
         // 回填本轮空 assistant(保持轮次交替),再注入 nudge user 消息,继续内层 while
@@ -352,14 +316,14 @@ export async function startChat(resumeCid?: string) {
       );
       if (isDoomLoop(recentCalls)) {
         const sig = recentCalls[recentCalls.length - 1]!;
-        const choice = await p.select({
-          message: `⚠ 检测到重复调用: ${sig.name} 已连续以相同参数调用多次,可能陷入死循环`,
-          options: [
-            { value: "continue" as const, label: "继续(可能是合法重试)" },
-            { value: "stop" as const, label: "停止并让模型总结当前进度" },
+        const choice = await term.select<"continue" | "stop">(
+          `⚠ 检测到重复调用: ${sig.name} 已连续以相同参数调用多次,可能陷入死循环`,
+          [
+            { value: "continue", label: "继续(可能是合法重试)" },
+            { value: "stop", label: "停止并让模型总结当前进度" },
           ],
-        });
-        const decision = p.isCancel(choice) || choice === "stop" ? "stop" : "continue";
+        );
+        const decision = isCancel(choice) || choice === "stop" ? "stop" : "continue";
         tracer.doomLoop({
           tool: sig.name,
           args: sig.args.slice(0, 200),
@@ -373,9 +337,11 @@ export async function startChat(resumeCid?: string) {
         recentCalls.length = 0;
       }
 
-      // 有工具调用：先回填 assistant（带 tool_calls + reasoning_content）。
+      // [DeepSeek适配] 有工具调用:先回填 assistant(带 tool_calls + reasoning_content)。
       // reasoning_content 是 DeepSeek thinking 模式的硬协议:缺了它,
-      // 下一轮请求直接 400——它不是"可选的思考记录",是请求报文的一部分
+      // 下一轮请求直接 400——它不是"可选的思考记录",是请求报文的一部分。
+      // 验证点:模型升级时确认 DeepSeek API 仍要求 thinking 原文回传;
+      // 若改为服务端自存,此字段与回填逻辑一并删除
       history.append({
         role: "assistant",
         content: answer,
@@ -439,13 +405,13 @@ export async function startChat(resumeCid?: string) {
             decision: "deny",
             reason: perm.reason,
           });
-          process.stdout.write(pc.red(`\n⛔ 已阻止: ${perm.reason}\n`));
+          term.notify(`\n⛔ 已阻止: ${perm.reason}\n`, "red");
           return { allowed: false, result: denialMessage(tc.function.name, perm.reason, true) };
         }
         if (perm.action === "ask") {
-          const choice = await p.select({
-            message: `⚠ 模型请求: ${perm.reason}`,
-            options: [
+          const choice = await term.select<"allow" | "session" | "persist" | "deny">(
+            `⚠ 模型请求: ${perm.reason}`,
+            [
               { value: "allow" as const, label: "允许一次" },
               ...(perm.rememberable
                 ? [
@@ -459,8 +425,8 @@ export async function startChat(resumeCid?: string) {
                 : []),
               { value: "deny" as const, label: "拒绝" },
             ],
-          });
-          if (p.isCancel(choice) || choice === "deny") {
+          );
+          if (isCancel(choice) || choice === "deny") {
             tracer.approval({
               tool: tc.function.name,
               action: "ask",
@@ -503,7 +469,7 @@ export async function startChat(resumeCid?: string) {
         // 慢工具提示:300ms 内跑完的不打扰(read_file 就几毫秒,提示反而是噪音);
         // 超过才打一行"执行中"(bash tsc 要几秒,静默期会让用户以为卡死)
         const slowTimer = setTimeout(() => {
-          process.stdout.write(pc.dim(`⏳ ${tc.function.name} 执行中…\n`));
+          term.notify(`⏳ ${tc.function.name} 执行中…\n`, "dim");
         }, 300);
         let result: string;
         let ok: boolean;
@@ -585,6 +551,9 @@ export async function startChat(resumeCid?: string) {
       });
     }
 
-    process.stdout.write("\n"); // 一次对话(可能多轮)结束，换行分隔下一轮 prompt
+    term.notify(""); // 一次对话(可能多轮)结束，换行分隔下一轮 prompt
   }
+
+  // 唯一的退出路径(cancel 分支 break 到这里):TUI 模式卸载 Ink、恢复终端
+  term.shutdown();
 }
